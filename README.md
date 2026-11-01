@@ -8,6 +8,15 @@ edit layered images, and run AI research — all from one desktop application.
 
 ---
 
+## Downloading from GitHub
+
+The main executable is stored with **Git LFS** because it is larger than GitHub's 100 MB file limit.
+
+- Open `AI Creator Studio by Twilight Studio.exe` on GitHub and use **Download**, or install Git LFS (`git lfs install`) and clone the repository.
+- Downloading the repository as a ZIP does **not** include LFS binaries; the executable will be a pointer file.
+
+---
+
 ## What's in this folder
 
 | Item | Description |
