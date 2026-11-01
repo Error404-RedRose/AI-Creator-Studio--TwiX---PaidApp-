@@ -1,0 +1,144 @@
+AI CREATOR STUDIO — END USER LICENSE AGREEMENT
+
+Copyright (c) 2026 Twilight Studio. All rights reserved.
+
+This End User License Agreement ("Agreement") governs your use of the AI Creator
+Studio desktop application, including its executable files, bundled resources,
+documentation, and any updates supplied by Twilight Studio (together, the
+"Software"). By installing, activating, or using the Software, you agree to this
+Agreement. If you do not agree, do not install or use the Software.
+
+1. LICENSOR
+
+"Twilight Studio", "we", "us", and "our" refer to the publisher of the Software.
+"You" and "your" refer to the individual or organization using the Software.
+
+2. LICENSE GRANT
+
+Subject to this Agreement and to a valid, active product key, Twilight Studio
+grants you a limited, non-exclusive, non-transferable, revocable license to:
+
+  a. install and run the Software on the number of devices permitted by your
+     product key; and
+  b. use the Software for your personal or internal business creative work.
+
+This is a license, not a sale. No ownership rights are transferred to you.
+
+3. PRODUCT KEYS AND ACTIVATION
+
+  a. The Software requires a product key and periodic online verification.
+  b. Product keys are confidential, non-transferable, and may be bound to the
+     device on which they are first activated.
+  c. You may not share, publish, sell, rent, sublicense, or otherwise distribute
+     product keys, and you may not bypass, disable, or interfere with activation,
+     license verification, or device-binding mechanisms.
+  d. Twilight Studio may suspend or revoke a product key that is expired,
+     refunded, charged back, shared, resold, or used in breach of this Agreement.
+
+4. RESTRICTIONS
+
+Except to the extent expressly permitted by applicable law, you may not:
+
+  a. copy, redistribute, publish, sell, rent, lease, sublicense, or otherwise
+     make the Software available to any third party;
+  b. modify, translate, adapt, or create derivative works of the Software;
+  c. reverse engineer, decompile, disassemble, or attempt to derive the source
+     code, algorithms, or activation logic of the Software;
+  d. remove, obscure, or alter any copyright, trademark, license, or proprietary
+     notice in the Software;
+  e. use the Software to develop a competing product or service;
+  f. use the Software in violation of any law or regulation; or
+  g. use the Software in any way that damages, disables, overloads, or impairs
+     Twilight Studio systems or third-party services.
+
+5. YOUR CONTENT
+
+You retain ownership of the projects, models, images, text, code, and other
+content you create with the Software ("Your Content"). You are responsible for
+Your Content and for having the rights needed to use it.
+
+To operate features you request, the Software may process Your Content locally
+and may send it to services you configure, such as OpenCode, OpenAI, Gemini,
+GitHub, DuckDuckGo, or your own endpoints. You are responsible for reviewing the
+terms and privacy practices of those services.
+
+6. THIRD-PARTY COMPONENTS
+
+The Software includes third-party and open-source components, including
+Electron, Chromium, Node.js, React, Three.js, Express, and Zustand. Those
+components are governed by their own licenses and copyright notices. Nothing in
+this Agreement limits rights granted to you under those licenses. Applicable
+license texts are included with the Software, including LICENSE.electron.txt
+and LICENSES.chromium.html.
+
+7. UPDATES AND CHANGES
+
+Twilight Studio may provide updates, fixes, or new versions at its discretion.
+This Agreement applies to updates unless an update is accompanied by a separate
+license. We may change features or requirements between versions. This is
+pre-release alpha software and may contain defects, incomplete features, or
+behavior that changes without notice.
+
+8. PRIVACY
+
+The Software stores settings, logs, references, and project data on your device.
+API keys and access tokens are stored locally and redacted from logs. Data is
+sent to external services only when you configure or invoke those services.
+Diagnostic logs may contain project paths and command output; review them before
+sharing.
+
+9. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, ACCURACY, OR UNINTERRUPTED OR
+ERROR-FREE OPERATION. TWILIGHT STUDIO DOES NOT WARRANT THAT THE SOFTWARE WILL
+MEET YOUR REQUIREMENTS OR THAT AI-GENERATED OUTPUT WILL BE ACCURATE, LAWFUL, OR
+SUITABLE FOR ANY PARTICULAR USE. YOU USE THE SOFTWARE AND ANY GENERATED OUTPUT
+AT YOUR OWN RISK.
+
+10. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, TWILIGHT STUDIO AND ITS AUTHORS,
+CONTRIBUTORS, AND SUPPLIERS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL,
+SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR LOST PROFITS, LOST DATA,
+BUSINESS INTERRUPTION, OR COST OF SUBSTITUTE SERVICES, ARISING OUT OF OR
+RELATED TO THE SOFTWARE OR THIS AGREEMENT, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, TWILIGHT STUDIO'S TOTAL AGGREGATE
+LIABILITY UNDER THIS AGREEMENT WILL NOT EXCEED THE AMOUNT YOU PAID FOR THE
+PRODUCT KEY GIVING RISE TO THE CLAIM IN THE TWELVE MONTHS BEFORE THE CLAIM.
+
+SOME JURISDICTIONS DO NOT ALLOW CERTAIN LIMITATIONS, SO SOME OF THE ABOVE MAY
+NOT APPLY TO YOU.
+
+11. TERMINATION
+
+This Agreement terminates automatically if you breach it, if your product key
+expires or is revoked, or if you stop using the Software and delete it. On
+termination, you must stop using the Software and delete all copies. Sections 4
+through 12 survive termination.
+
+12. GENERAL
+
+  a. This Agreement is the entire agreement between you and Twilight Studio
+     regarding the Software and supersedes prior discussions on the same subject.
+  b. If any provision is found unenforceable, the remaining provisions remain in
+     effect.
+  c. Failure to enforce a provision is not a waiver.
+  d. You may not assign this Agreement without our written consent. We may assign
+     it in connection with a merger, acquisition, or sale of assets.
+  e. This Agreement is governed by the laws applicable in Twilight Studio's
+     principal place of business, without regard to conflict-of-law rules. Nothing
+     here limits mandatory consumer rights in your jurisdiction.
+
+13. CONTACT
+
+Twilight Studio
+Email: twilightstudio.dev@gmail.com
+Discord: https://discord.gg/V2vDQCUSNe
+Website: https://twilightstudio.carrd.co/
+
+For licensing, activation, or permission requests, contact Twilight Studio
+before redistributing the Software or any part of it.

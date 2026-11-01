@@ -1,0 +1,21 @@
+{
+  "name": "com.twilightstudio.creatorstudio",
+  "displayName": "AI Creator Studio Bridge",
+  "version": "0.2.1",
+  "unity": "2021.3",
+  "description": "Local Unity Editor bridge for AI Creator Studio by Twilight Studio. Lets the desktop app inspect and edit live scenes, components, materials, assets and project settings, refresh assets, compile scripts and control play mode.",
+  "keywords": [
+    "ai",
+    "editor",
+    "bridge",
+    "3d",
+    "twilight-studio"
+  ],
+  "author": {
+    "name": "Twilight Studio"
+  },
+  "dependencies": {},
+  "documentationUrl": "https://twilight.studio",
+  "changelogUrl": "CHANGELOG.md",
+  "licensesUrl": "LICENSE.md"
+}
