@@ -1,6 +1,6 @@
 # AI Creator Studio
 
-**By Twilight Studio** · Version **0.7.0-alpha.1** · Windows x64
+**By Twilight Studio** · Version **0.7.1-alpha.1** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,
@@ -8,12 +8,39 @@ edit layered images, and run AI research — all from one desktop application.
 
 ---
 
-## Downloading from GitHub
+## Downloading and installing from GitHub
 
-The main executable is stored with **Git LFS** because it is larger than GitHub's 100 MB file limit.
+The main executable is stored with **Git LFS** because it is larger than GitHub's
+100 MB file limit. A plain ZIP download contains a small **pointer file** instead of
+the real program (about 134 bytes), so use one of these methods.
 
-- Open `Creator Studio.exe` on GitHub and use **Download**, or install Git LFS (`git lfs install`) and clone the repository.
-- Downloading the repository as a ZIP does **not** include LFS binaries; the executable will be a pointer file.
+### Recommended: run `install.bat`
+
+1. Download the repository as a ZIP and extract it completely.
+2. Open the extracted folder and run **`install.bat`**.
+3. The installer downloads the complete build, verifies the 238 MB executable, and
+   starts Creator Studio.
+
+`install.bat` uses `git clone` plus `git lfs pull` when Git is installed. If Git is
+missing, it offers a direct download of the executable from GitHub's LFS media
+endpoint, so no developer tools are required. Run it again any time you need to
+restore the executable.
+
+### Manual: clone with Git LFS
+
+```text
+git lfs install
+git clone https://github.com/Error404-RedRose/AI-Creator-Studio--TwiX---PaidApp-.git
+cd AI-Creator-Studio--TwiX---PaidApp-
+git lfs pull
+```
+
+Then run `Creator Studio.exe`.
+
+### Manual: single executable
+
+Open `Creator Studio.exe` on GitHub and use **Download** on the file page. The file
+is about 238 MB; keep it in the same folder as the rest of the release files.
 
 ---
 
@@ -22,6 +49,7 @@ The main executable is stored with **Git LFS** because it is larger than GitHub'
 | Item | Description |
 | --- | --- |
 | `Creator Studio.exe` | The application. Run it from this folder. |
+| `install.bat` | Restores the full executable when the repository was downloaded as a ZIP. |
 | `resources/`, `locales/`, `*.dll`, `*.pak`, `*.bin` | Required runtime files. Do not move or delete them. |
 | `README.md` | This document. |
 | `LICENSE.txt` | License terms for AI Creator Studio. |
@@ -49,10 +77,11 @@ The app is Windows-first. Other platforms are not packaged or supported.
 
 ## Run the app
 
-1. Open `Creator Studio.exe` in this folder.
-2. If Windows SmartScreen appears, choose **More info → Run anyway**. The build is not
+1. If `Creator Studio.exe` is only about 134 bytes, run `install.bat` first.
+2. Open `Creator Studio.exe` in this folder.
+3. If Windows SmartScreen appears, choose **More info → Run anyway**. The build is not
    code-signed.
-3. Enter your product key when the activation screen appears.
+4. Enter your product key when the activation screen appears.
 
 The application opens as a full-screen, frameless window with a custom title bar. Use the title
 bar buttons for Home, minimize, and close.
@@ -176,6 +205,13 @@ notes. Projects should be backed up separately.
 - Confirm the executable is still inside this folder with its DLLs, `resources`, and `locales`.
 - Re-extract or re-copy the complete build if files were moved or deleted.
 - Check **Settings → Diagnostics** after a successful launch, or open the log folder shown there.
+
+**The updater stops with a folder or rename error**
+- This can happen once when updating from a build older than 0.7.1 that was launched from
+  its own folder. Windows will not rename a folder while a process is using it, and the
+  old helper ran from inside the application folder.
+- Run `install.bat` in this folder (or extract a fresh release ZIP and run it), then open
+  Creator Studio. Updates work normally from 0.7.1 onward.
 
 **Windows SmartScreen warning**
 - Choose **More info → Run anyway**. The build is not code-signed.

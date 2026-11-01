@@ -134,6 +134,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       const lines = [
         "@echo off",
         "title Creator Studio Update",
+        `cd /d "%TEMP%"`,
         `powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update-helper.ps1" -InstallDir "${installDir}" -ExeName "${UPDATE_EXE_NAME}" -Repo "${UPDATE_REPO}" -Branch "${UPDATE_BRANCH}" -ParentPid ${process.pid} -ExpectedVersion "${status.remoteVersion}"`,
         "exit /b %ERRORLEVEL%",
         "",
@@ -141,6 +142,7 @@ function registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog }) {
       fs.writeFileSync(launcher, lines.join("\r\n"), "utf8");
 
       const child = spawn("cmd.exe", ["/c", "start", "", launcher], {
+        cwd: app.getPath("temp"),
         detached: true,
         stdio: "ignore",
         windowsHide: false,
