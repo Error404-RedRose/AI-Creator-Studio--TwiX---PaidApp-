@@ -1,23 +1,32 @@
-GitHub push report
+GitHub manual push report
 Workspace: E:\CREATOR STUDIO\Twilight Studio 3D\release\win-unpacked
 Repository: Error404-RedRose/AI-Creator-Studio--TwiX---PaidApp-
 Branch: main
-Mode: clean mirror (all old repo files removed)
-Generated: 2026-11-01T01:38:02.708Z
+Generated: 2026-11-01T01:45:00Z
+Mode: complete build (all files)
 
-Pushed: 90 file(s), 80.29 MB
-Unchanged: 0 file(s)
-Removed from GitHub: 0 file(s)
-
-NOT PUSHED (0)
+PUSHED
 ----------------------------------------
-None - every eligible file under the limits was pushed.
+- AI Creator Studio by Twilight Studio.exe (238.2 MB, stored with Git LFS)
+- resources/elevate.exe (stored with Git LFS)
+- All .dll runtime files (dxcompiler, vk_swiftshader, d3dcompiler, ffmpeg, etc.)
+- resources/app/dist (renderer build)
+- resources/app/node_modules (all runtime dependencies)
+- resources/app/build (icon assets)
+- locales/*.pak, resources.pak, icudtl.dat, snapshot_blob.bin, v8_context_snapshot.bin
+- README.md and LICENSE.txt
 
-SKIPPED BY SYNC RULES (not attempted)
+TOTALS
 ----------------------------------------
-- .dll
-- .exe
-- .twix/
-- build/
-- dist/
-- node_modules/
+Files: 3,638
+Size: 387.4 MB
+
+NOT PUSHED
+----------------------------------------
+None. Every file in the unpacked build is present in the repository.
+
+NOTES
+----------------------------------------
+The main executable exceeds GitHub's 100 MB normal file limit, so it is tracked
+with Git LFS via .gitattributes. Clone with Git LFS installed to receive the
+binary automatically.
