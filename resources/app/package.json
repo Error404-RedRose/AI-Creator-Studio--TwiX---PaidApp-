@@ -1,9 +1,10 @@
 {
   "name": "3d-creator-studio-twilight",
+  "productName": "Creator Studio",
   "private": true,
-  "version": "0.6.0-alpha.1",
+  "version": "0.7.0-alpha.1",
   "type": "module",
-  "description": "AI Creator Studio by Twilight Studio - AI-assisted 3D creation and manual modeling",
+  "description": "Creator Studio - AI-assisted 3D creation and manual modeling",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "express": "^5.1.0",
@@ -14,5 +15,8 @@
     "zustand": "^5.0.3"
   },
   "main": "electron/main.cjs",
-  "author": "Twilight Studio"
+  "author": {
+    "name": "Twilight Studio",
+    "email": "twilightstudio.dev@gmail.com"
+  }
 }

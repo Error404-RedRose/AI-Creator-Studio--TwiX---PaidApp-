@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("twixDesktop", {
   pickDirectory: () => ipcRenderer.invoke("dialog:openDirectory"),
   saveTextFile: (defaultName, content, filters) => ipcRenderer.invoke("file:saveText", { defaultName, content, filters }),
   openTextFile: (filters) => ipcRenderer.invoke("file:openText", { filters }),
+  checkForUpdates: (force) => ipcRenderer.invoke("updates:check", Boolean(force)),
+  applyUpdate: () => ipcRenderer.invoke("updates:apply"),
   log: (entry) => ipcRenderer.send("app:log", entry),
   onHome: (callback) => {
     const handler = () => callback();

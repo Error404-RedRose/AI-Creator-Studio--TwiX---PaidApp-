@@ -1,6 +1,6 @@
 # AI Creator Studio
 
-**By Twilight Studio** · Version **0.6.0-alpha.1** · Windows x64
+**By Twilight Studio** · Version **0.7.0-alpha.1** · Windows x64
 
 A native Windows creative workspace where AI agents and manual tools share the same project.
 Model in 3D, simulate cloth, format writing, code with an AI agent, drive a live Unity Editor,
@@ -12,7 +12,7 @@ edit layered images, and run AI research — all from one desktop application.
 
 The main executable is stored with **Git LFS** because it is larger than GitHub's 100 MB file limit.
 
-- Open `AI Creator Studio by Twilight Studio.exe` on GitHub and use **Download**, or install Git LFS (`git lfs install`) and clone the repository.
+- Open `Creator Studio.exe` on GitHub and use **Download**, or install Git LFS (`git lfs install`) and clone the repository.
 - Downloading the repository as a ZIP does **not** include LFS binaries; the executable will be a pointer file.
 
 ---
@@ -21,7 +21,7 @@ The main executable is stored with **Git LFS** because it is larger than GitHub'
 
 | Item | Description |
 | --- | --- |
-| `AI Creator Studio by Twilight Studio.exe` | The application. Run it from this folder. |
+| `Creator Studio.exe` | The application. Run it from this folder. |
 | `resources/`, `locales/`, `*.dll`, `*.pak`, `*.bin` | Required runtime files. Do not move or delete them. |
 | `README.md` | This document. |
 | `LICENSE.txt` | License terms for AI Creator Studio. |
@@ -49,7 +49,7 @@ The app is Windows-first. Other platforms are not packaged or supported.
 
 ## Run the app
 
-1. Open `AI Creator Studio by Twilight Studio.exe` in this folder.
+1. Open `Creator Studio.exe` in this folder.
 2. If Windows SmartScreen appears, choose **More info → Run anyway**. The build is not
    code-signed.
 3. Enter your product key when the activation screen appears.

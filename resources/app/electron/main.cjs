@@ -3,12 +3,14 @@ const path = require("node:path");
 const fs = require("node:fs");
 const net = require("node:net");
 const { spawn } = require("node:child_process");
+const { registerUpdateHandlers } = require("./updates.cjs");
 
 const isDev = process.env.TWIX_DEV === "1";
 const appRoot = path.join(__dirname, "..");
 const serverScript = path.join(appRoot, "server", "index.mjs");
 const distDir = path.join(appRoot, "dist");
 
+app.setName("Creator Studio");
 app.setAppUserModelId("com.twilightstudio.creatorstudio3d");
 
 let mainWindow = null;
@@ -36,6 +38,8 @@ process.on("unhandledRejection", (error) => {
   console.error(error);
 });
 ipcMain.on("app:log", (_event, entry) => writeMainLog(entry));
+
+registerUpdateHandlers({ app, ipcMain, path, fs, spawn, mainLog });
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -171,7 +175,7 @@ async function createWindow() {
       : "The TwiX backend did not start. Check the terminal log or try build.bat again.";
     await mainWindow.loadURL(
       `data:text/html;charset=utf-8,${encodeURIComponent(
-        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:560px;text-align:center"><h1 style="font-weight:600">AI Creator Studio</h1><p style="color:#9b95b2;line-height:1.6">${message}</p></div></body>`,
+        `<body style="margin:0;background:#0b0a12;color:#ece8fa;font-family:Segoe UI,sans-serif;display:grid;place-items:center;height:100vh"><div style="max-width:560px;text-align:center"><h1 style="font-weight:600">Creator Studio</h1><p style="color:#9b95b2;line-height:1.6">${message}</p></div></body>`,
       )}`,
     );
   }
