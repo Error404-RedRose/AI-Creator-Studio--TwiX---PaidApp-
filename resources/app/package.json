@@ -2,7 +2,7 @@
   "name": "3d-creator-studio-twilight",
   "productName": "Creator Studio",
   "private": true,
-  "version": "0.7.1-alpha.1",
+  "version": "0.9.0-alpha.1",
   "type": "module",
   "description": "Creator Studio - AI-assisted 3D creation and manual modeling",
   "dependencies": {

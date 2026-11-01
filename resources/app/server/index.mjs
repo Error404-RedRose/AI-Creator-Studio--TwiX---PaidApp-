@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLicenseService } from "./license.mjs";
+import { assessCommand } from "../shared/command-safety.mjs";
 
 process.on("uncaughtException", (error) => {
   console.error("[TwiX] uncaughtException", error?.stack || error);
@@ -222,6 +223,8 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 
 const clients = new Map(); // projectId -> Set<ws>
 const pendingTools = new Map(); // callId -> {resolve, timer, projectId}
+const commandApprovals = new Map(); // id -> {resolve, timer, request}
+const COMMAND_APPROVAL_TIMEOUT_MS = 240000;
 
 function broadcast(projectId, message) {
   const set = clients.get(projectId);
@@ -230,6 +233,19 @@ function broadcast(projectId, message) {
   for (const ws of set) {
     if (ws.readyState === 1) ws.send(raw);
   }
+}
+
+/**
+ * Safety approvals are urgent: if the socket for the originating project is
+ * not connected (for example the user switched workspace), every open window
+ * still gets the prompt so nobody misses a destructive command.
+ */
+function broadcastApproval(projectId, message) {
+  if (projectId && clients.get(projectId)?.size) {
+    broadcast(projectId, message);
+    return;
+  }
+  for (const [id] of clients) broadcast(id, message);
 }
 
 async function ensureDir(dir) {
@@ -641,6 +657,9 @@ async function saveSettings(patch) {
 const GITHUB_API = "https://api.github.com";
 const GITHUB_CACHE_TTL = 10 * 60 * 1000;
 const githubCache = new Map();
+const githubSearchCache = new Map();
+const GITHUB_SEARCH_TTL = 5 * 60 * 1000;
+const GITHUB_SEARCH_MAX_CHARS = 256;
 
 // Conservative safety limits. GitHub hard-rejects files over 100 MB and large
 // pushes; staying well below those limits prevents a push from wedging the
@@ -746,7 +765,7 @@ function githubRetryDelayMs(error, attempt) {
 }
 
 async function githubRequestWithRetry(pathname, options = {}) {
-  const maxAttempts = 4;
+  const maxAttempts = Math.max(1, Math.min(4, Number(options.maxAttempts || 4)));
   let lastError = null;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
@@ -907,6 +926,53 @@ function githubQueryFromPrompt(query) {
     .join(" ");
 }
 
+/**
+ * GitHub search rejects or silently mangles very long prompts. Keep the query
+ * under the documented 256 character limit so a natural language request still
+ * produces a usable search instead of a validation error.
+ */
+function normalizeGitHubSearchQuery(input) {
+  const clean = String(input || "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (clean.length <= GITHUB_SEARCH_MAX_CHARS) return clean;
+  const terms = clean.split(" ");
+  const qualifiers = terms.filter((term) => /^[a-z]+:/i.test(term));
+  const words = terms.filter((term) => !/^[a-z]+:/i.test(term));
+  const kept = [...qualifiers];
+  for (const word of words) {
+    if ([...kept, word].join(" ").length > GITHUB_SEARCH_MAX_CHARS) break;
+    kept.push(word);
+  }
+  return kept.join(" ").slice(0, GITHUB_SEARCH_MAX_CHARS);
+}
+
+/** Turn a raw GitHub API failure into a message the model and the UI can act on. */
+function githubSearchErrorText(error, area) {
+  const status = Number(error?.status || 0);
+  if (status === 401) {
+    return "GitHub rejected the saved token (401). Open Settings -> GitHub and paste a new fine-grained token.";
+  }
+  if (status === 403 && githubIsRateLimited(error)) {
+    const reset = Number(error?.headers?.get?.("x-ratelimit-reset"));
+    const when = Number.isFinite(reset) && reset > 0 ? new Date(reset * 1000).toLocaleTimeString() : "a few minutes";
+    return "GitHub " + area + " reached its rate limit. Try again after " + when + ".";
+  }
+  if (status === 403 || status === 404) {
+    return (
+      "GitHub " + area + " was refused. A fine-grained token needs Repository access for the searched repos and Contents: Read permission."
+    );
+  }
+  if (status === 422) {
+    return "GitHub " + area + " rejected the query. Use shorter keywords, or scope it with repo:owner/name.";
+  }
+  if (/timeout|aborted/i.test(String(error?.message || ""))) {
+    return "GitHub " + area + " timed out. Try shorter keywords.";
+  }
+  return error?.message ? String(error.message).slice(0, 300) : "GitHub " + area + " failed.";
+}
+
 async function githubContextFor(query) {
   try {
     const settings = await getSettings();
@@ -919,7 +985,7 @@ async function githubContextFor(query) {
     const lines = [];
     const repoResult = await githubApi(
       `/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${limit}`,
-      { settings, timeoutMs: 6000 },
+      { settings, timeoutMs: 6000, maxAttempts: 1 },
     ).catch(() => null);
     for (const item of repoResult?.data?.items || []) {
       lines.push(
@@ -929,7 +995,7 @@ async function githubContextFor(query) {
     if (settings.github?.token) {
       const codeResult = await githubApi(
         `/search/code?q=${encodeURIComponent(q)}&per_page=${limit}`,
-        { settings, timeoutMs: 6000, accept: "application/vnd.github.text-match+json" },
+        { settings, timeoutMs: 6000, maxAttempts: 1, accept: "application/vnd.github.text-match+json" },
       ).catch(() => null);
       for (const item of codeResult?.data?.items || []) {
         const fragment = item.text_matches?.[0]?.fragment || "";
@@ -1015,7 +1081,8 @@ function researchInstructions() {
     "You answer questions, compare options, explain topics and summarise sources for the user.",
     "",
     "## Hard rules",
-    "- You have GitHub tools only: github_status, github_search_repositories, github_search_code, github_repo_tree, github_read_file, github_download_file, github_download_zip and download_url. Never use scene, shell or coding-write tools.",
+    "- Use only the GitHub tools exposed in this session. In Research they are named github_github_* (the MCP server is github), for example github_github_status, github_github_search_repositories, github_github_search_code, github_github_repo_tree and github_github_read_file. Short names such as github_search_code do not exist and will fail.",
+    "- download_url is available for direct http(s) file downloads. Never use scene, shell or coding-write tools.",
     "- You have live GitHub access. Search public repositories, inspect full trees and README/C#/source files, download exact files or repository ZIPs, and log useful finds as references. Never say you cannot browse GitHub.",
     "- You cannot browse the general live web by yourself. Web search results may be appended to this prompt; use them and cite their titles and URLs.",
     "- If no web results are provided, answer from general knowledge and say clearly that the answer is not web-verified.",
@@ -1654,7 +1721,7 @@ Trusted workspace: **${trusted ? "ON ? full PC access" : "OFF ? workspace read-o
 4. Explain file changes and command results clearly. Show errors and warnings in the response.
 5. Do not claim a build or test passed unless the command output confirms it.
 6. Keep the user's existing project structure and conventions. Do not overwrite unrelated files.
-7. GitHub is live and fully available: use github_status, github_search_repositories, github_search_code, github_repo_tree, github_read_file, github_download_file and github_download_zip. Never say you cannot browse GitHub. Search public repositories, inspect full trees, read README/C#/source files, download exact files into the workspace, and log useful finds as references. Never push or post without the user asking.
+7. GitHub is live and fully available through the coding_ prefixed tools: coding_github_status, coding_github_search_repositories, coding_github_search_code, coding_github_repo_tree, coding_github_read_file, coding_github_download_file, coding_github_download_zip. Use those exact names; a short name such as github_search_code does not exist in this session. Reference Library lookups use coding_reference_search, coding_reference_sources and coding_reference_read. Never say you cannot browse GitHub. Search public repositories, inspect full trees, read README/C#/source files, download exact files into the workspace, and log useful finds as references. Never push or post without the user asking.
 8. If the workspace is read-only, say what you would change and ask the user to enable trusted workspace.
 9. Work linearly: plan a short sequence, then complete one edit or command at a time. Do not spawn subagents or parallel tasks.
 10. Use GitHub proactively when related repositories, code, README files or assets would improve the result. Reference and session context are supporting background; ignore them only when irrelevant.
@@ -1663,8 +1730,12 @@ Trusted workspace: **${trusted ? "ON ? full PC access" : "OFF ? workspace read-o
 ${unitySection}`;
 }
 
+function codingWorkspaceDir(projectId) {
+  return path.join(DATA_DIR, "coding-agents", projectId);
+}
+
 async function writeCodingWorkspace(projectId, dir, trusted, unityPort = null) {
-  const workspace = path.join(DATA_DIR, "coding-agents", projectId);
+  const workspace = codingWorkspaceDir(projectId);
   await ensureDir(workspace);
   const config = {
     $schema: "https://opencode.ai/config.json",
@@ -1681,6 +1752,8 @@ async function writeCodingWorkspace(projectId, dir, trusted, unityPort = null) {
           TWIX_BRIDGE_URL: `http://127.0.0.1:${PORT}`,
           TWIX_BRIDGE_TOKEN: BRIDGE_TOKEN,
           TWIX_DATA_DIR: DATA_DIR,
+          TWIX_RESEARCH_GATE_FILE: path.join(workspace, "research-gate.json"),
+          TWIX_CODING_PROJECT_ID: projectId,
         },
       },
     },
@@ -2691,8 +2764,9 @@ app.post("/api/coding/chat", async (req, res) => {
       if (!image?.dataUrl) continue;
       parts.push({ type: "file", mime: image.mime || "image/png", filename: image.name || "reference.png", url: image.dataUrl });
     }
-    const referenceContext = await referenceContextFor(text);
-    const githubContext = await githubContextFor(text);
+    const research = await preflightResearch(text);
+    const referenceContext = research.referenceText;
+    const githubContext = research.githubText;
     const globalContext = await globalLearningContextFor(text);
     const sessionContext = await sessionContextFor(state, text);
     const baseSystem = [
@@ -2704,11 +2778,13 @@ app.post("/api/coding/chat", async (req, res) => {
       state.unityPort ? `Unity bridge port: ${state.unityPort}` : "Unity bridge is not connected.",
       "Use coding_* tools for files and commands. Use unity_* tools for Unity state, compile, focus, refresh, play and stop when available.",
       "Work mainly in the selected workspace. Work linearly, one edit or command at a time. Report build/compile results honestly.",
+      research.briefing,
       githubContext,
       referenceContext,
       sessionContext,
       system,
     ].filter(Boolean).join("\n");
+    await writeResearchGate(projectId, research, text);
     const response = await ocFetch(state, `/session/${sid}/message`, {
       method: "POST",
       body: JSON.stringify({ model, agent: "coder", system: baseSystem, parts }),
@@ -2742,9 +2818,145 @@ app.post("/api/coding/chat", async (req, res) => {
       globalLearning: globalContext.slice(0, 4000),
       savedAt: new Date().toISOString(),
     }).catch(() => null);
-    res.json({ ok: true, sessionId: sid, text: responseText, reasoning, tools });
+    res.json({ ok: true, sessionId: sid, text: responseText, reasoning, tools, research: { counts: research.counts, elapsedMs: research.elapsedMs } });
   } catch (error) {
     log("error", "coding", "chat failed", { message: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/coding/command-check", async (req, res) => {
+  try {
+    const command = String(req.body?.command || "");
+    if (!command.trim()) return res.status(400).json({ error: "command is required" });
+    const assessment = assessCommand(command, {
+      cwd: String(req.body?.cwd || ""),
+      platform: String(req.body?.platform || process.platform),
+    });
+    res.json({ ok: true, assessment });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/coding/command-approvals", async (req, res) => {
+  try {
+    const projectId = String(req.query.projectId || "");
+    const now = Date.now();
+    const pending = [...commandApprovals.values()]
+      .map((entry) => entry.request)
+      .filter((request) => request && (!projectId || request.projectId === projectId))
+      .filter((request) => new Date(request.expiresAt).getTime() > now);
+    res.json({ ok: true, requests: pending });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/coding/command-approval", async (req, res) => {
+  try {
+    const command = String(req.body?.command || "");
+    const cwd = String(req.body?.cwd || "");
+    const projectId = String(req.body?.projectId || "");
+    const sessionId = String(req.body?.sessionId || "");
+    if (!command.trim()) return res.status(400).json({ error: "command is required" });
+    const assessment = assessCommand(command, {
+      cwd,
+      platform: String(req.body?.platform || process.platform),
+    });
+    if (!assessment.requiresApproval) {
+      return res.json({ ok: true, approved: true, automatic: true, assessment });
+    }
+    const id = "cmd_" + randomUUID().slice(0, 10);
+    const request = {
+      id,
+      projectId,
+      sessionId,
+      command: command.slice(0, 6000),
+      cwd,
+      requestedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + COMMAND_APPROVAL_TIMEOUT_MS).toISOString(),
+      severity: assessment.severity,
+      summary: assessment.summary,
+      reasons: assessment.reasons,
+      categories: assessment.categories,
+      matched: assessment.matched,
+      targets: assessment.targets,
+      platform: assessment.platform,
+    };
+    log("warning", "safety", "dangerous command awaiting approval", {
+      id,
+      projectId,
+      severity: assessment.severity,
+      categories: assessment.categories,
+      command: command.slice(0, 500),
+    });
+    broadcastApproval(projectId, { type: "coding.commandApproval", request });
+    const decision = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        commandApprovals.delete(id);
+        broadcastApproval(projectId, { type: "coding.commandApprovalResolved", id, approved: false, expired: true });
+        resolve({
+          approved: false,
+          expired: true,
+          reason: "No one approved the command within " + Math.round(COMMAND_APPROVAL_TIMEOUT_MS / 1000) + " seconds.",
+        });
+      }, COMMAND_APPROVAL_TIMEOUT_MS);
+      if (typeof timer.unref === "function") timer.unref();
+      commandApprovals.set(id, { resolve, timer, request });
+    });
+    res.json({
+      ok: true,
+      id,
+      approved: Boolean(decision.approved),
+      automatic: false,
+      expired: Boolean(decision.expired),
+      reason: decision.reason || "",
+      assessment,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/coding/command-approval/respond", async (req, res) => {
+  try {
+    const id = String(req.body?.id || "");
+    const approved = req.body?.approved === true;
+    const entry = commandApprovals.get(id);
+    if (!entry) return res.status(404).json({ error: "This approval request has already been resolved or expired." });
+    clearTimeout(entry.timer);
+    commandApprovals.delete(id);
+    entry.resolve({
+      approved,
+      reason: approved ? "" : "The user denied this command.",
+    });
+    broadcastApproval(entry.request.projectId, { type: "coding.commandApprovalResolved", id, approved });
+    log(approved ? "warning" : "info", "safety", "dangerous command " + (approved ? "approved" : "denied"), {
+      id,
+      projectId: entry.request.projectId,
+      command: entry.request.command.slice(0, 500),
+    });
+    res.json({ ok: true, id, approved });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/research/preflight", async (req, res) => {
+  try {
+    const query = String(req.query.q || "").trim();
+    if (!query) return res.status(400).json({ error: "q is required" });
+    const research = await preflightResearch(query);
+    res.json({
+      ok: true,
+      query,
+      terms: research.terms,
+      counts: research.counts,
+      elapsedMs: research.elapsedMs,
+      briefing: research.briefing,
+    });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
@@ -2770,10 +2982,11 @@ app.post("/api/coding/prompt", async (req, res) => {
     linkedRepo = linkedRepo || githubRepo || null;
     const githubInstructions = [
       linkedRepo
-        ? `Linked GitHub repository: ${linkedRepo.fullName} (branch ${linkedRepo.branch || linkedRepo.defaultBranch}). The link manifest is .twix/github.json. Use github_* tools with this owner/repo when the user asks to push or pull, search, read or download files.`
+        ? `Linked GitHub repository: ${linkedRepo.fullName} (branch ${linkedRepo.branch || linkedRepo.defaultBranch}). The link manifest is .twix/github.json. Use the coding_github_* tools with this owner/repo when the user asks to push or pull, search, read or download files.`
         : "No GitHub repository is linked in the coding sidebar. If the workspace already has a .git/config remote, inspect it before assuming there is none; otherwise do not push or pull until the user links one.",
-      "GitHub safety: files over 25 MB and batches over 50 MB are blocked before GitHub can lock the repository. Never push binary textures or audio through github_push_files; use github_download_file or download_url to bring assets into the workspace, then commit small text changes.",
-      "GitHub awareness: use github_search_code, github_search_repositories, github_repo_tree and github_read_file to inspect repositories. Pull exact files with github_download_file. Use download_url only when the user asks for an external asset download.",
+      "GitHub safety: files over 25 MB and batches over 50 MB are blocked before GitHub can lock the repository. Never push binary textures or audio through coding_github_push_files; use coding_github_download_file or coding_download_url to bring assets into the workspace, then commit small text changes.",
+      "GitHub awareness: use coding_github_search_code, coding_github_search_repositories, coding_github_repo_tree and coding_github_read_file (exact names) to inspect repositories. Pull exact files with coding_github_download_file. Use coding_download_url only when the user asks for an external asset download.",
+      "Reference Library: coding_reference_search searches the user's indexed folders and links, coding_reference_sources lists them and coding_reference_read opens one entry. Use these before assuming there is no local documentation.",
     ].join("\n");
     let sid = sessionId;
     if (!sid) {
@@ -2785,8 +2998,12 @@ app.post("/api/coding/prompt", async (req, res) => {
       if (!image?.dataUrl) continue;
       parts.push({ type: "file", mime: image.mime || "image/png", filename: image.name || "reference.png", url: image.dataUrl });
     }
-    const referenceContext = await referenceContextFor(text || "");
-    const githubContext = await githubContextFor(text || "");
+    // Pre-flight research runs before the model is called: GitHub repositories
+    // and code plus the indexed local links and folders are all in the system
+    // prompt before the first tool call can happen.
+    const research = await preflightResearch(text || "");
+    const referenceContext = research.referenceText;
+    const githubContext = research.githubText;
     const globalContext = await globalLearningContextFor(text || "");
     const sessionContext = await sessionContextFor(state, text || "");
     const system = [
@@ -2796,11 +3013,14 @@ app.post("/api/coding/prompt", async (req, res) => {
       `Workspace root: ${state.root}`,
       `Trusted workspace: ${state.trusted ? "ON - full PC access" : "OFF"}`,
       "Use coding_* tools only. Work mainly in the selected workspace, linearly, one edit or command at a time. Report build/test results honestly.",
+      "The Pre-flight research briefing below already ran for this prompt. Consult it before your first coding_write_file or coding_run_command. The MCP research gate blocks writes and commands when no fresh briefing exists.",
+      research.briefing,
       githubInstructions,
       githubContext,
       referenceContext,
       sessionContext,
     ].filter(Boolean).join("\n");
+    await writeResearchGate(projectId, research, text);
     await ocFetch(state, `/session/${sid}/prompt_async`, {
       method: "POST",
       body: JSON.stringify({ model, agent: "coder", system, parts }),
@@ -2816,10 +3036,12 @@ app.post("/api/coding/prompt", async (req, res) => {
       globalLearning: globalContext.slice(0, 4000),
       references: referenceContext.slice(0, 4000),
       githubResearch: githubContext.slice(0, 4000),
+      preflight: research.briefing.slice(0, 4000),
+      preflightCounts: research.counts,
       images: images.map((image) => image?.name).filter(Boolean),
       savedAt: new Date().toISOString(),
     }).catch(() => null);
-    res.json({ ok: true, sessionId: sid, recovery });
+    res.json({ ok: true, sessionId: sid, recovery, research: { counts: research.counts, elapsedMs: research.elapsedMs } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3922,6 +4144,121 @@ async function loadReferenceIndex() {
   return readJson(REFERENCE_INDEX_FILE(), { updatedAt: null, entries: [] });
 }
 
+// The index is rebuilt automatically at app load and after a source changes.
+// A signature of the saved folders/links makes that cheap: an index that
+// already matches the sources is reused instead of re-crawled.
+const REFERENCE_INDEX_TTL = 10 * 60 * 1000;
+
+function referenceSourceSignature(settings) {
+  const folders = (settings.references?.folders || [])
+    .map((folder) => String(folder.id) + ":" + path.resolve(String(folder.path || "")).toLowerCase())
+    .sort();
+  const links = (settings.references?.links || [])
+    .map((link) => String(link.id) + ":" + String(link.url || ""))
+    .sort();
+  return createHash("sha1").update(JSON.stringify({ folders, links })).digest("hex");
+}
+
+function referenceIndexIsFresh(index, signature) {
+  if (!index?.updatedAt || !Array.isArray(index.entries)) return false;
+  if (index.signature && index.signature !== signature) return false;
+  const age = Date.now() - new Date(index.updatedAt).getTime();
+  return Number.isFinite(age) && age >= 0 && age < REFERENCE_INDEX_TTL;
+}
+
+let referenceIndexChain = Promise.resolve();
+let referenceIndexJob = null;
+let referenceIndexTimer = null;
+const referenceSourceTimers = new Map();
+
+function runReferenceIndexJob(job) {
+  const run = referenceIndexChain.then(job, job);
+  referenceIndexChain = run.then(() => {}, () => {});
+  return run;
+}
+
+async function autoIndexReferences(options = {}) {
+  const force = Boolean(options.force);
+  if (referenceIndexJob) return referenceIndexJob;
+  const job = runReferenceIndexJob(async () => {
+    const settings = await getSettings();
+    const signature = referenceSourceSignature(settings);
+    const index = await loadReferenceIndex();
+    if (!force && referenceIndexIsFresh(index, signature)) {
+      return { ok: true, skipped: true, updatedAt: index.updatedAt, count: index.entries.length, signature };
+    }
+    const next = await scanReferenceSources(settings);
+    return { ok: true, skipped: false, updatedAt: next.updatedAt, count: next.entries.length, signature: next.signature };
+  });
+  referenceIndexJob = job;
+  try {
+    return await job;
+  } finally {
+    if (referenceIndexJob === job) referenceIndexJob = null;
+  }
+}
+
+/** Debounced background rebuild used at boot and whenever the UI asks for one. */
+function scheduleReferenceIndex(delayMs = 1200, force = false) {
+  if (referenceIndexTimer) clearTimeout(referenceIndexTimer);
+  referenceIndexTimer = setTimeout(() => {
+    referenceIndexTimer = null;
+    void autoIndexReferences({ force }).catch((error) => {
+      log("warning", "references", "background index failed", { message: error.message });
+    });
+  }, Math.max(200, Number(delayMs) || 1200));
+  if (typeof referenceIndexTimer.unref === "function") referenceIndexTimer.unref();
+}
+
+/** Re-index a single link or folder right after it is added. */
+function scheduleReferenceSourceRefresh(kind, id) {
+  if (!id) return;
+  const key = kind + ":" + id;
+  if (referenceSourceTimers.has(key)) clearTimeout(referenceSourceTimers.get(key));
+  const timer = setTimeout(() => {
+    referenceSourceTimers.delete(key);
+    void runReferenceIndexJob(async () => {
+      const settings = await getSettings();
+      const index = await loadReferenceIndex();
+      const kept = (index.entries || []).filter((entry) => entry.sourceId !== id);
+      const added = [];
+      if (kind === "folder") {
+        const folder = (settings.references?.folders || []).find((item) => item.id === id);
+        if (folder) await scanReferenceFolder(folder, added);
+      } else if (kind === "link") {
+        const link = (settings.references?.links || []).find((item) => item.id === id);
+        if (link) await scanReferenceLink(link, added, 1);
+      }
+      const next = {
+        updatedAt: new Date().toISOString(),
+        signature: referenceSourceSignature(settings),
+        entries: [...kept, ...added].slice(0, 5000),
+      };
+      await writeReferenceIndex(next);
+      log("info", "references", "source re-indexed", { kind, id, added: added.length, count: next.entries.length });
+    }).catch((error) => {
+      log("warning", "references", "source re-index failed", { kind, id, message: error.message });
+    });
+  }, 900);
+  if (typeof timer.unref === "function") timer.unref();
+  referenceSourceTimers.set(key, timer);
+}
+
+/** Drop the entries of a removed source without re-crawling anything. */
+function scheduleReferenceIndexCleanup(sourceId) {
+  if (!sourceId) return;
+  void runReferenceIndexJob(async () => {
+    const settings = await getSettings();
+    const index = await loadReferenceIndex();
+    const entries = (index.entries || []).filter((entry) => entry.sourceId !== sourceId);
+    await writeReferenceIndex({
+      updatedAt: new Date().toISOString(),
+      signature: referenceSourceSignature(settings),
+      entries,
+    });
+  }).catch(() => {});
+}
+
 async function scanReferenceFolder(folder, entries) {
   const root = path.resolve(folder.path);
   if (!fssync.existsSync(root) || !fssync.statSync(root).isDirectory()) return;
@@ -4051,14 +4388,18 @@ async function writeReferenceIndex(index) {
   await fs.writeFile(REFERENCE_NOTES_FILE(), notes, "utf8");
 }
 
-async function scanReferenceSources() {
-  const settings = await getSettings();
+async function scanReferenceSources(settingsOverride) {
+  const settings = settingsOverride || (await getSettings());
   const entries = [];
   const folders = settings.references?.folders || [];
   const links = settings.references?.links || [];
   for (const folder of folders) await scanReferenceFolder(folder, entries);
   await scanLinksConcurrently(links, entries);
-  const index = { updatedAt: new Date().toISOString(), entries: entries.slice(0, 5000) };
+  const index = {
+    updatedAt: new Date().toISOString(),
+    signature: referenceSourceSignature(settings),
+    entries: entries.slice(0, 5000),
+  };
   await writeReferenceIndex(index);
   return index;
 }
@@ -4070,25 +4411,99 @@ async function scanReferenceLinksOnly() {
   const links = settings.references?.links || [];
   const entries = [];
   await scanLinksConcurrently(links, entries);
-  const index = { updatedAt: new Date().toISOString(), entries: [...kept, ...entries].slice(0, 5000) };
+  const index = {
+    updatedAt: new Date().toISOString(),
+    signature: referenceSourceSignature(settings),
+    entries: [...kept, ...entries].slice(0, 5000),
+  };
   await writeReferenceIndex(index);
   return { index, links: links.length, urlEntries: entries.length };
 }
 
-function searchReferenceEntries(index, query, limit = 10) {
-  const terms = tokenizeReference(query);
+const REFERENCE_MEDIA_EXT =
+  /\.(wav|mp3|flac|ogg|m4a|aac|mp4|mov|avi|mkv|png|jpe?g|gif|webp|bmp|tga|psd|tif|tiff|fbx|obj|blend|max|ma|mb|zip|rar|7z|exe|dll|asd|meta|pyc)$/i;
+const REFERENCE_MEDIA_QUERY =
+  /(audio|sound|sfx|music|song|track|texture|image|photo|picture|model|mesh|animation|video|clip|asset|sprite|icon|font|material)/i;
+
+function searchReferenceEntries(index, query, limit = 10, options = {}) {
+  // Manual Reference Library searches stay permissive; the automatic pre-flight
+  // briefing only keeps distinctive matches so it never distracts a coder.
+  const strict = options.strict === true;
+  const terms = tokenizeReference(query).filter((term) => !RESEARCH_STOPWORDS.has(term));
   if (!terms.length || !index?.entries?.length) return [];
-  const scored = index.entries.map((entry) => {
-    const haystack = (entry.title + " " + (entry.path || "") + " " + (entry.url || "") + " " + (entry.keywords || []).join(" ") + " " + (entry.summary || "") + " " + (entry.text || "")).toLowerCase();
-    let score = 0;
-    for (const term of terms) {
-      if (entry.title?.toLowerCase().includes(term)) score += 5;
-      if ((entry.keywords || []).includes(term)) score += 3;
-      if (haystack.includes(term)) score += 1;
+  const mediaQuery = REFERENCE_MEDIA_QUERY.test(String(query || ""));
+  const items = index.entries.map((entry) => ({
+    entry,
+    title: String(entry.title || "").toLowerCase(),
+    keywords: (entry.keywords || []).join(" ").toLowerCase(),
+    location: String(entry.path || entry.url || "").toLowerCase(),
+    summary: String(entry.summary || "").toLowerCase(),
+    text: String(entry.text || "").toLowerCase(),
+    media: REFERENCE_MEDIA_EXT.test(String(entry.path || entry.url || "")),
+  }));
+  // Down-weight words that appear across the whole index ("game", "file") so a
+  // rare project name outranks a common word in a song title.
+  const documentFrequency = new Map();
+  for (const term of terms) {
+    let count = 0;
+    for (const item of items) {
+      if (
+        item.title.includes(term) ||
+        item.keywords.includes(term) ||
+        item.location.includes(term) ||
+        item.summary.includes(term)
+      ) {
+        count++;
+      }
     }
-    return { entry, score };
-  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score).slice(0, Math.max(1, Math.min(30, limit)));
-  return scored.map((item) => item.entry);
+    documentFrequency.set(term, count);
+  }
+  // A distinctive word ("zombie", "three.js") is what proves an entry is
+  // related. Common words ("game", "player") match hundreds of unrelated files,
+  // so a multi-word coding prompt must hit at least one rare term.
+  const rareTerms = new Set(
+    terms.filter((term) => (documentFrequency.get(term) || 0) <= Math.max(20, items.length * 0.01)),
+  );
+  const requireRare = terms.length > 2 && rareTerms.size > 0;
+  const scored = [];
+  for (const item of items) {
+    // Media and binary files only match title text; keep them out of code
+    // research unless the user actually asked for that kind of asset.
+    if (item.media && !mediaQuery) continue;
+    let score = 0;
+    let strong = false;
+    let rareHit = false;
+    for (const term of terms) {
+      const weight = 1 / (1 + Math.log(1 + (documentFrequency.get(term) || 0)));
+      let termScore = 0;
+      if (item.title.includes(term)) {
+        termScore += 5;
+        strong = true;
+        if (rareTerms.has(term)) rareHit = true;
+      }
+      if (item.keywords.includes(term)) {
+        termScore += 3;
+        if (rareTerms.has(term)) rareHit = true;
+      }
+      if (item.location.includes(term)) {
+        termScore += 2;
+        strong = true;
+        if (rareTerms.has(term)) rareHit = true;
+      }
+      if (item.summary.includes(term)) termScore += 1;
+      if (item.text.includes(term)) termScore += 1;
+      score += termScore * weight;
+    }
+    if (!strong || score <= 0) continue;
+    if (strict && requireRare && !rareHit) continue;
+    scored.push({ entry: item.entry, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0]?.score || 0;
+  return scored
+    .filter((item) => item.score >= (strict ? Math.max(2, best * 0.35) : Math.max(1.2, best * 0.2)))
+    .slice(0, Math.max(1, Math.min(30, limit)))
+    .map((item) => item.entry);
 }
 
 const globalLearningFilesCache = { at: 0, files: [] };
@@ -4224,9 +4639,282 @@ async function globalLearningContextFor(query) {
   }
 }
 
+// Pre-flight research. Every coding prompt runs these searches BEFORE the
+// model is called, so related GitHub projects and indexed local references are
+// already in its system context before the first command or file edit.
+const RESEARCH_STOPWORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "have", "has", "are", "was", "were", "you", "your",
+  "can", "could", "should", "would", "will", "just", "like", "need", "needs", "want", "wants", "make",
+  "makes", "made", "use", "using", "used", "into", "about", "when", "where", "what", "which", "how",
+  "why", "all", "any", "but", "not", "out", "get", "got", "its", "also", "then", "than", "them", "they",
+  "there", "here", "some", "more", "most", "very", "much", "many", "one", "two", "new", "old", "app",
+  "application", "project", "code", "coding", "stuff", "thing", "things", "something", "please", "help",
+  "build", "building", "create", "creating", "file", "files", "add", "adding", "fix", "fixing", "update",
+  "updating", "change", "changing", "start", "starting", "first", "next", "after", "before", "over",
+  "existing", "current", "same", "already", "work", "works", "working", "able", "want", "wanted", "look",
+  "looks", "good", "better", "best", "set", "sets", "setting", "settings", "run", "running", "write",
+  "writing", "line", "lines", "way", "ways", "time", "times", "every", "each", "other", "only", "own",
+  "through", "between", "under", "while", "until", "because", "since", "does", "put", "puts", "take",
+  "takes", "give", "gives", "show", "shows", "keep", "keeps", "adds", "remove", "removes", "edit",
+  "edits", "updates", "changes", "thing", "maybe", "sure", "really", "actually", "currently",
+  "github", "search", "find", "random", "lookup", "research",
+]);
+
+function researchTerms(input, limit = 12) {
+  const seen = new Set();
+  const out = [];
+  const words = String(input || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .toLowerCase()
+    .split(/[^a-z0-9_+#.:-]+/i)
+    .map((word) => word.replace(/^[.:-]+|[.:-]+$/g, ""))
+    .filter((word) => word.length >= 3 && !RESEARCH_STOPWORDS.has(word));
+  for (const word of words) {
+    if (seen.has(word)) continue;
+    seen.add(word);
+    out.push(word);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+async function referencePreflight(text, limit = 10) {
+  try {
+    const index = await loadReferenceIndex();
+    const matches = searchReferenceEntries(index, text, limit, { strict: true });
+    const updatedAt = index.updatedAt || null;
+    const age = updatedAt ? Date.now() - new Date(updatedAt).getTime() : Infinity;
+    const stale = !Number.isFinite(age) || age > REFERENCE_INDEX_TTL;
+    // A coding prompt should never wait on a crawl, but it should also never
+    // trust a cold index. Search what exists and top the index up in the
+    // background for the next prompt.
+    if (stale) scheduleReferenceIndex(400);
+    return { updatedAt, total: index.entries?.length || 0, matches, stale };
+  } catch {
+    return { updatedAt: null, total: 0, matches: [], stale: true };
+  }
+}
+
+async function githubPreflight(text) {
+  const summary = { repositories: [], code: [], notes: [] };
+  let settings;
+  try {
+    settings = await getSettings();
+  } catch {
+    return summary;
+  }
+  if (settings.github?.autoResearch === false) {
+    summary.notes.push("GitHub research is disabled in Settings.");
+    return summary;
+  }
+  const terms = researchTerms(text, 12);
+  if (!terms.length) return summary;
+  const hasToken = Boolean(githubPrimaryToken(settings));
+  // Pre-flight research has a tight budget: two parallel first tries plus one
+  // parallel narrowing pass, and no retry after a timeout.
+  const options = { settings, timeoutMs: 5000, maxAttempts: 1 };
+  const searchRepos = (q, override) =>
+    githubApi(
+      `/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=6`,
+      override || options,
+    );
+  const searchCode = (q, override) =>
+    githubApi(`/search/code?q=${encodeURIComponent(q)}&per_page=6`, {
+      ...(override || options),
+      accept: "application/vnd.github.text-match+json",
+    });
+  const full = terms.slice(0, 8).join(" ");
+  let [repoResult, codeResult] = await Promise.all([
+    searchRepos(full).catch((error) => ({ error })),
+    hasToken ? searchCode(full).catch((error) => ({ error })) : Promise.resolve({ skipped: true }),
+  ]);
+  // Short retry keeps a keyword-heavy prompt from returning nothing even though
+  // GitHub has related work. Narrow queries match far more often.
+  const timedOut = (result) => /timeout|aborted/i.test(String(result?.error?.message || ""));
+  const needRepo = !repoResult?.data?.items?.length && !timedOut(repoResult);
+  const needCode = hasToken && !codeResult?.data?.items?.length && !timedOut(codeResult);
+  if ((needRepo || needCode) && terms.length > 3) {
+    const narrow = terms.slice(0, 3).join(" ");
+    const retryOptions = { ...options, timeoutMs: 4000 };
+    const [repoFallback, codeFallback] = await Promise.all([
+      needRepo ? searchRepos(narrow, retryOptions).catch((error) => ({ error })) : Promise.resolve(null),
+      needCode ? searchCode(narrow, retryOptions).catch((error) => ({ error })) : Promise.resolve(null),
+    ]);
+    if (repoFallback) repoResult = repoFallback;
+    if (codeFallback) codeResult = codeFallback;
+  }
+  if (repoResult?.error) summary.notes.push(githubSearchErrorText(repoResult.error, "repository search"));
+  const seenRepos = new Set();
+  for (const item of repoResult?.data?.items || []) {
+    if (!item?.full_name || seenRepos.has(item.full_name)) continue;
+    seenRepos.add(item.full_name);
+    summary.repositories.push({
+      full_name: item.full_name,
+      url: item.html_url,
+      description: item.description || "",
+      stars: item.stargazers_count || 0,
+      language: item.language || "",
+    });
+    if (summary.repositories.length >= 6) break;
+  }
+  if (codeResult?.skipped) {
+    summary.notes.push("Code search needs a connected fine-grained GitHub token.");
+  } else {
+    if (codeResult?.error) summary.notes.push(githubSearchErrorText(codeResult.error, "code search"));
+    const seenCode = new Set();
+    for (const item of codeResult?.data?.items || []) {
+      // Data dumps and logs match code search by accident; only keep files
+      // that could hold an implementation worth reading.
+      if (/\.(csv|tsv|log|jsonl|sql|lock|map|min\.js|pyc|dll|exe)$/i.test(item.path || "")) continue;
+      const key = (item.repository?.full_name || "") + ":" + item.path;
+      if (!key || seenCode.has(key)) continue;
+      seenCode.add(key);
+      summary.code.push({
+        repo: item.repository?.full_name || "",
+        path: item.path,
+        url: item.html_url,
+        fragment: String(item.text_matches?.[0]?.fragment || "").replace(/\s+/g, " ").slice(0, 240),
+      });
+      if (summary.code.length >= 6) break;
+    }
+  }
+  return summary;
+}
+
+function buildPreflightBriefing(text, local, remote, elapsedMs) {
+  const lines = [
+    "# Pre-flight research (already completed for this prompt)",
+    "The studio ran these searches before you were called. Read this briefing before your first command, file write or file edit.",
+  ];
+  const counts = {
+    references: local.matches.length,
+    referenceIndexEntries: local.total,
+    repositories: remote.repositories.length,
+    code: remote.code.length,
+  };
+  if (local.matches.length) {
+    lines.push("", `## Local Reference Library (${local.matches.length} of ${local.total} indexed entries)`);
+    for (const entry of local.matches.slice(0, 8)) {
+      const location = entry.url || entry.path || "";
+      lines.push(`- [${entry.type}] ${entry.title} - ${location} (id: ${entry.id})`);
+      if (entry.summary) lines.push("  " + String(entry.summary).replace(/\s+/g, " ").slice(0, 240));
+    }
+    lines.push("Open any match with coding_reference_read (pass its id) before you write code.");
+  } else {
+    lines.push("", "## Local Reference Library", "No indexed link or folder entry matched this prompt.");
+  }
+  if (local.stale) {
+    lines.push(
+      "The reference index is cold or older than " +
+        Math.round(REFERENCE_INDEX_TTL / 60000) +
+        " minutes; a background refresh was queued for the next prompt.",
+    );
+  }
+  if (remote.repositories.length) {
+    lines.push("", `## GitHub repositories (${remote.repositories.length} matches)`);
+    for (const repo of remote.repositories) {
+      lines.push(
+        `- ${repo.full_name} (${repo.stars} stars${repo.language ? ", " + repo.language : ""}) - ${repo.url}` +
+          (repo.description ? " - " + String(repo.description).replace(/\s+/g, " ").slice(0, 180) : ""),
+      );
+    }
+  } else {
+    lines.push("", "## GitHub repositories", "No public repository matched this prompt's keywords.");
+  }
+  if (remote.code.length) {
+    lines.push("", `## GitHub code (${remote.code.length} matches)`);
+    for (const hit of remote.code) {
+      lines.push(`- ${hit.repo}/${hit.path} - ${hit.url}`);
+      if (hit.fragment) lines.push("  " + hit.fragment.slice(0, 220));
+    }
+    lines.push("Inspect a match with coding_github_repo_tree and coding_github_read_file before implementing.");
+  }
+  if (remote.notes.length) {
+    lines.push("", "GitHub notes: " + remote.notes.slice(0, 3).join(" "));
+  }
+  lines.push(
+    "",
+    "## Required use",
+    "- If a local reference matches, open it (coding_reference_read) before editing.",
+    "- If a GitHub repository or file matches, inspect it (coding_github_repo_tree / coding_github_read_file) before inventing an implementation.",
+    "- Mention the reference id or repository path you used in your summary. If nothing matched, say so and work from the project itself.",
+    `- Research took ${elapsedMs} ms.`,
+  );
+  return { briefing: lines.join("\n").slice(0, 9500), counts };
+}
+
+async function preflightResearch(text) {
+  const query = String(text || "").slice(0, 1500);
+  const started = Date.now();
+  let local;
+  let remote;
+  try {
+    [local, remote] = await Promise.all([referencePreflight(query, 8), githubPreflight(query)]);
+  } catch (error) {
+    // Research must never block a coding prompt. Fall back to an empty briefing
+    // and let the model work from the project itself.
+    log("warning", "coding", "pre-flight research failed", { message: error.message });
+    return {
+      briefing: "# Pre-flight research\nResearch could not complete (" + String(error.message).slice(0, 160) + "). Continue from the project and say which reference you could not verify.",
+      counts: { references: 0, repositories: 0, code: 0 },
+      terms: researchTerms(query, 8).join(" "),
+      elapsedMs: Date.now() - started,
+      referenceText: "",
+      githubText: "",
+    };
+  }
+  const composed = buildPreflightBriefing(query, local, remote, Date.now() - started);
+  const referenceText = local.matches.length
+    ? "Reference index matches (local folders and links):\n" +
+      local.matches
+        .map((entry) => "- " + entry.type + ": " + entry.title + " - " + (entry.url || entry.path || ""))
+        .join("\n")
+    : "";
+  const githubText = remote.repositories.length || remote.code.length
+    ? "GitHub research matches:\n" +
+      [
+        ...remote.repositories.map((repo) => "- [repo] " + repo.full_name + " - " + repo.url),
+        ...remote.code.map((hit) => "- [code] " + hit.repo + "/" + hit.path + " - " + hit.url),
+      ].join("\n")
+    : "";
+  return {
+    briefing: composed.briefing,
+    counts: composed.counts,
+    terms: researchTerms(query, 8).join(" "),
+    elapsedMs: Date.now() - started,
+    referenceText,
+    githubText,
+  };
+}
+
+async function writeResearchGate(projectId, research, prompt) {
+  if (!projectId) return false;
+  try {
+    const dir = codingWorkspaceDir(projectId);
+    await ensureDir(dir);
+    await writeJsonAtomic(path.join(dir, "research-gate.json"), {
+      at: new Date().toISOString(),
+      projectId,
+      counts: research?.counts || {},
+      query: research?.terms || "",
+      elapsedMs: research?.elapsedMs || 0,
+      prompt: String(prompt || "").slice(0, 500),
+    });
+    log("info", "coding", "pre-flight research complete", {
+      projectId,
+      counts: research?.counts || {},
+      elapsedMs: research?.elapsedMs || 0,
+    });
+    return true;
+  } catch (error) {
+    log("warning", "coding", "research gate write failed", { projectId, message: error.message });
+    return false;
+  }
+}
+
 const knowledgeInstructions = [
   "Knowledge briefing: the context below combines the permanent Global Learning library, indexed local references and public GitHub research. Review it before running commands or changing files. It records what this app has already built, which tools and prompts worked, existing assets and the user's conventions.",
-  "If the request is about code, Unity, 3D models, materials, shaders, textures, writing or a public repository, inspect the relevant local reference paths and use github_search_repositories, github_search_code, github_repo_tree and github_read_file to verify public repositories before acting. Never claim GitHub is unavailable. Verify before copying.",
+  "If the request is about code, Unity, 3D models, materials, shaders, textures, writing or a public repository, inspect the relevant local reference paths and verify public repositories with the GitHub tools actually exposed in this session (coding_github_* in Coding mode, github_github_* in Research). If reference tools are exposed in this session (coding_reference_search, coding_reference_sources, coding_reference_read), use them to search the user's indexed folders and links. Never guess a tool name, never claim GitHub is unavailable, and verify before copying.",
 ].join("\n");
 
 async function referenceContextFor(query) {
@@ -4344,7 +5032,9 @@ app.post(
 
 app.post("/api/references/scan", async (req, res) => {
   try {
-    const index = await scanReferenceSources();
+    const force = req.query.force !== "0";
+    await autoIndexReferences({ force });
+    const index = await loadReferenceIndex();
     res.json({ ok: true, updatedAt: index.updatedAt, count: index.entries.length, entries: index.entries.slice(0, 40) });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -4367,12 +5057,90 @@ app.post("/api/references/scan-links", async (req, res) => {
   }
 });
 
+app.get("/api/references/status", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const index = await loadReferenceIndex();
+    const signature = referenceSourceSignature(settings);
+    res.json({
+      ok: true,
+      updatedAt: index.updatedAt || null,
+      count: index.entries?.length || 0,
+      stale: !referenceIndexIsFresh(index, signature),
+      busy: Boolean(referenceIndexJob),
+      signature,
+      sources: {
+        folders: settings.references?.folders?.length || 0,
+        links: settings.references?.links?.length || 0,
+      },
+      ttlMs: REFERENCE_INDEX_TTL,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/references/auto-index", async (req, res) => {
+  try {
+    const force = req.query.force === "1" || req.body?.force === true;
+    const background = req.query.background === "1" || req.body?.background === true;
+    if (background) {
+      scheduleReferenceIndex(200, force);
+      return res.json({ ok: true, scheduled: true });
+    }
+    const result = await autoIndexReferences({ force });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/references/entry", async (req, res) => {
+  try {
+    const id = String(req.query.id || "").trim();
+    const url = String(req.query.url || "").trim();
+    const wantedPath = String(req.query.path || "").trim();
+    const maxChars = Math.max(200, Math.min(20000, Number(req.query.maxChars || 8000)));
+    const index = await loadReferenceIndex();
+    const entries = index.entries || [];
+    const entry = id
+      ? entries.find((item) => item.id === id)
+      : url
+        ? entries.find((item) => item.url === url)
+        : wantedPath
+          ? entries.find((item) => item.path === wantedPath || String(item.path || "").endsWith(wantedPath))
+          : null;
+    if (!entry) {
+      return res.status(404).json({
+        ok: false,
+        error: "Reference entry not found in the index. Run reference_search first, or refresh the index.",
+      });
+    }
+    res.json({
+      ok: true,
+      updatedAt: index.updatedAt,
+      entry: { ...entry, text: String(entry.text || "").slice(0, maxChars) },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/references/search", async (req, res) => {
   try {
     const query = String(req.query.q || "");
+    const limit = Math.max(1, Math.min(30, Number(req.query.limit || 12)));
     const index = await loadReferenceIndex();
-    const matches = searchReferenceEntries(index, query, Number(req.query.limit || 12));
-    res.json({ ok: true, query, updatedAt: index.updatedAt, count: index.entries.length, matches });
+    const settings = await getSettings();
+    const stale = !referenceIndexIsFresh(index, referenceSourceSignature(settings));
+    // Search returns immediately with the current index and refreshes it in the
+    // background when sources changed; a live web crawl must never block a tool.
+    if (stale) scheduleReferenceIndex(500);
+    const matches = searchReferenceEntries(index, query, limit).map((entry) => ({
+      ...entry,
+      text: String(entry.text || "").slice(0, 2000),
+    }));
+    res.json({ ok: true, query, updatedAt: index.updatedAt, count: index.entries.length, stale, matches });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4411,6 +5179,7 @@ app.post("/api/references/folder", async (req, res) => {
       await saveSettings({ references: { folders: [folder, ...(settings.references?.folders || [])] } });
     }
     res.json({ ok: true, folder });
+    scheduleReferenceSourceRefresh("folder", folder.id);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4428,6 +5197,7 @@ app.delete("/api/references/folder", async (req, res) => {
       const settings = await getSettings();
       await saveSettings({ references: { folders: (settings.references?.folders || []).filter((folder) => folder.id !== id) } });
     }
+    scheduleReferenceIndexCleanup(String(id || ""));
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -4513,6 +5283,7 @@ app.post("/api/references/link", async (req, res) => {
       await saveSettings({ references: { links: [link, ...(settings.references?.links || [])] } });
     }
     res.json({ ok: true, link });
+    scheduleReferenceSourceRefresh("link", link.id);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4532,6 +5303,7 @@ app.delete("/api/references/link", async (req, res) => {
         references: { links: (settings.references?.links || []).filter((link) => link.id !== id) },
       });
     }
+    scheduleReferenceIndexCleanup(String(id || ""));
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -5119,17 +5891,41 @@ app.get("/api/github/repos/:owner/:repo/zip", async (req, res) => {
 
 app.get("/api/github/search", async (req, res) => {
   try {
-    const query = String(req.query.q || "").trim();
+    const rawQuery = String(req.query.q || "").trim();
+    const query = normalizeGitHubSearchQuery(rawQuery);
     const type = String(req.query.type || "both");
     const limit = Math.max(1, Math.min(50, Number(req.query.limit || 12)));
     if (!query) return res.status(400).json({ error: "A search query is required." });
+    const cacheKey = type + "|" + limit + "|" + query.toLowerCase();
+    const cached = githubSearchCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < GITHUB_SEARCH_TTL) {
+      return res.json({ ...cached.payload, cached: true });
+    }
+    const settings = await getSettings();
     const repositories = [];
     const code = [];
+    let repoError = "";
     let codeError = "";
+    // One short attempt per search keeps the request inside the coding tool
+    // bridge timeout. The old retry loop could spend 90 seconds on a rate limit
+    // and surface as a broken tool call.
+    const options = { settings, timeoutMs: 10000, maxAttempts: 1 };
     if (type !== "code") {
-      const repoResult = await githubApi(
+      let repoResult = await githubApi(
         `/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=${limit}`,
+        options,
       ).catch((error) => ({ error }));
+      // A full sentence can match nothing even when GitHub has related work.
+      // Retry with the three most distinctive words before reporting empty.
+      if (!repoResult?.data?.items?.length) {
+        const narrow = researchTerms(query, 3).join(" ");
+        if (narrow && narrow.toLowerCase() !== query.toLowerCase()) {
+          repoResult = await githubApi(
+            `/search/repositories?q=${encodeURIComponent(narrow)}&sort=stars&order=desc&per_page=${limit}`,
+            options,
+          ).catch((error) => ({ error }));
+        }
+      }
       for (const item of repoResult?.data?.items || []) {
         repositories.push({
           id: `repo:${item.full_name}`,
@@ -5142,28 +5938,57 @@ app.get("/api/github/search", async (req, res) => {
           language: item.language,
         });
       }
-      if (repoResult?.error) codeError = repoResult.error.message;
+      if (repoResult?.error) repoError = githubSearchErrorText(repoResult.error, "repository search");
     }
     if (type !== "repositories") {
-      const codeResult = await githubApi(
-        `/search/code?q=${encodeURIComponent(query)}&per_page=${limit}`,
-        { accept: "application/vnd.github.text-match+json" },
-      ).catch((error) => ({ error }));
-      for (const item of codeResult?.data?.items || []) {
-        const fragment = item.text_matches?.[0]?.fragment || "";
-        code.push({
-          id: `code:${item.repository?.full_name || ""}:${item.path}`,
-          title: item.path,
-          url: item.html_url,
-          repo: item.repository?.full_name || "",
-          path: item.path,
-          description: fragment.replace(/\s+/g, " ").slice(0, 400),
-          kind: "code",
-        });
+      if (!githubPrimaryToken(settings) && !process.env.TWIX_GITHUB_TOKEN) {
+        codeError = "GitHub code search needs a connected account. Add a fine-grained token in Settings -> GitHub.";
+      } else {
+        let codeResult = await githubApi(
+          `/search/code?q=${encodeURIComponent(query)}&per_page=${limit}`,
+          { ...options, accept: "application/vnd.github.text-match+json" },
+        ).catch((error) => ({ error }));
+        if (!codeResult?.data?.items?.length) {
+          const narrow = researchTerms(query, 4).join(" ");
+          if (narrow && narrow.toLowerCase() !== query.toLowerCase()) {
+            codeResult = await githubApi(
+              `/search/code?q=${encodeURIComponent(narrow)}&per_page=${limit}`,
+              { ...options, accept: "application/vnd.github.text-match+json" },
+            ).catch((error) => ({ error }));
+          }
+        }
+        for (const item of codeResult?.data?.items || []) {
+          const fragment = item.text_matches?.[0]?.fragment || "";
+          code.push({
+            id: `code:${item.repository?.full_name || ""}:${item.path}`,
+            title: item.path,
+            url: item.html_url,
+            repo: item.repository?.full_name || "",
+            path: item.path,
+            description: fragment.replace(/\s+/g, " ").slice(0, 400),
+            kind: "code",
+          });
+        }
+        if (codeResult?.error) codeError = githubSearchErrorText(codeResult.error, "code search");
       }
-      if (codeResult?.error) codeError = codeError || codeResult.error.message;
     }
-    res.json({ ok: true, query, repositories, code, codeError });
+    const payload = {
+      ok: true,
+      query,
+      originalQuery: rawQuery !== query ? rawQuery : undefined,
+      repositories,
+      code,
+      repoError,
+      codeError,
+    };
+    githubSearchCache.set(cacheKey, { at: Date.now(), payload });
+    if (githubSearchCache.size > 120) {
+      for (const key of githubSearchCache.keys()) {
+        if (githubSearchCache.size <= 90) break;
+        githubSearchCache.delete(key);
+      }
+    }
+    res.json(payload);
   } catch (error) {
     res.status(502).json({ error: error.message });
   }
@@ -6387,6 +7212,10 @@ await pruneLogs();
 await ensureDir(globalReferencesDir());
 await ensureDir(await normalizeProjectDir());
 await ensureExampleMod();
+
+// Index saved reference folders and links as soon as the app boots. The
+// signature check keeps a warm index from being crawled again.
+scheduleReferenceIndex(2500);
 
 server.listen(PORT, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${PORT}`;

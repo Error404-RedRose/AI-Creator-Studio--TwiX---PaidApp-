@@ -7,6 +7,7 @@ import fssync from "node:fs";
 import path from "node:path";
 import { exec } from "node:child_process";
 import { codingTools } from "../shared/coding-tools.mjs";
+import { assessCommand } from "../shared/command-safety.mjs";
 
 const ROOT = path.resolve(process.env.TWIX_CODING_ROOT || process.cwd());
 const TRUSTED = process.env.TWIX_CODING_TRUSTED === "1";
@@ -16,6 +17,42 @@ const IGNORED = new Set(["node_modules", ".git", ".svn", "dist", "build", ".next
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_ZIP_BYTES = 200 * 1024 * 1024;
 const GITHUB_ONLY = process.env.TWIX_GITHUB_ONLY === "1";
+// The app writes a research gate after every coding prompt, once GitHub and the
+// indexed local references have been searched. Mutating tools refuse to run
+// without a fresh gate, which guarantees research happened before any edit.
+const RESEARCH_GATE_FILE = process.env.TWIX_RESEARCH_GATE_FILE || "";
+const CODING_PROJECT_ID = process.env.TWIX_CODING_PROJECT_ID || "";
+const RESEARCH_GATE_TTL = 60 * 60 * 1000;
+
+function researchGateStatus() {
+  if (!RESEARCH_GATE_FILE) return { required: false, ok: true, reason: "" };
+  let gate = null;
+  try {
+    gate = JSON.parse(fssync.readFileSync(RESEARCH_GATE_FILE, "utf8"));
+  } catch {
+    gate = null;
+  }
+  if (!gate) {
+    return { required: true, ok: false, reason: "no pre-flight research briefing exists for this prompt" };
+  }
+  const at = new Date(gate.at || 0).getTime();
+  if (!Number.isFinite(at) || Date.now() - at > RESEARCH_GATE_TTL) {
+    return { required: true, ok: false, reason: "the pre-flight research briefing is stale" };
+  }
+  return { required: true, ok: true, reason: "", counts: gate.counts || {} };
+}
+
+function assertResearchGate(toolName) {
+  const status = researchGateStatus();
+  if (!status.required || status.ok) return;
+  throw new Error(
+    "Pre-flight research gate blocked " +
+      toolName +
+      ": " +
+      status.reason +
+      ". The Coding editor searches GitHub and the indexed Reference Library before every prompt; send the prompt again so the briefing exists, then retry.",
+  );
+}
 
 function resolveInRoot(input = ".") {
   const target = path.resolve(ROOT, String(input || "."));
@@ -172,6 +209,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
     }
     if (name === "write_file") {
+      assertResearchGate(name);
       if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode." }, true);
       const target = resolvePath(args.path);
       await fs.mkdir(path.dirname(target), { recursive: true });
@@ -230,6 +268,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return respond({ ok: true, query, matches });
     }
     if (name === "run_command") {
+      assertResearchGate(name);
       if (UNITY_PORT) {
         return respond(
           { ok: false, error: "Shell commands are disabled in Unity sessions. Use the unity_* bridge tools for Unity, and the Coding applet for host shell work." },
@@ -248,6 +287,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return respond({ ok: false, error: error.message }, true);
         }
       }
+      // Creator Studio command safety: classify before anything runs. A
+      // dangerous command must be approved in the desktop UI; if the approval
+      // bridge is unavailable the command is denied rather than run blind.
+      const assessment = assessCommand(command, { cwd, platform: process.platform });
+      let approvedDanger = false;
+      if (assessment.requiresApproval) {
+        if (!BRIDGE_URL) {
+          return respond(
+            {
+              ok: false,
+              blocked: true,
+              denied: true,
+              error:
+                "Creator Studio Safety blocked this command because the approval bridge is unavailable. " +
+                (assessment.reasons[0] || assessment.summary),
+              assessment,
+            },
+            true,
+          );
+        }
+        let approval;
+        try {
+          approval = await bridgeFetch("/api/coding/command-approval", {
+            method: "POST",
+            timeoutMs: 260000,
+            body: {
+              command,
+              cwd,
+              projectId: CODING_PROJECT_ID,
+              platform: process.platform,
+            },
+          });
+        } catch (error) {
+          return respond(
+            {
+              ok: false,
+              blocked: true,
+              denied: true,
+              error:
+                "Creator Studio Safety blocked this command because approval could not be requested (" +
+                error.message +
+                "). " +
+                (assessment.reasons[0] || assessment.summary),
+              assessment,
+            },
+            true,
+          );
+        }
+        if (!approval?.approved) {
+          return respond(
+            {
+              ok: false,
+              blocked: true,
+              denied: true,
+              error:
+                "Creator Studio Safety: " +
+                (approval?.reason || "the user denied this command.") +
+                " Nothing was run. " +
+                (approval?.assessment?.summary || assessment.summary),
+              assessment: approval?.assessment || assessment,
+            },
+            true,
+          );
+        }
+        approvedDanger = true;
+      }
       const result = await new Promise((resolve) => {
         exec(
           command,
@@ -262,9 +367,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         );
       });
-      return respond({ ok: result.code === 0, ...result });
+      return respond({
+        ok: result.code === 0,
+        ...result,
+        ...(approvedDanger ? { safety: { approved: true, severity: assessment.severity } } : {}),
+      });
     }
-    if (name.startsWith("github_")) {
+    if (name.startsWith("reference_")) {
+      if (name === "reference_sources") {
+        return respond(await bridgeFetch("/api/references"));
+      }
+      if (name === "reference_search") {
+        const query = String(args.query || "").trim();
+        if (!query) return respond({ ok: false, error: "query is required" }, true);
+        const limit = Math.max(1, Math.min(30, Number(args.limit ?? 8)));
+        const payload = await bridgeFetch(
+          `/api/references/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+        );
+        return respond(payload, false);
+      }
+      if (name === "reference_read") {
+        const params = new URLSearchParams({
+          id: String(args.id || ""),
+          url: String(args.url || ""),
+          path: String(args.path || ""),
+          maxChars: String(Math.max(200, Math.min(20000, Number(args.maxChars ?? 8000)))),
+        });
+        return respond(await bridgeFetch(`/api/references/entry?${params}`));
+      }
+    }
+    if (name.startsWith("github_") || name === "download_url") {
       if (name === "github_status") {
         return respond(await bridgeFetch("/api/github/status"));
       }
@@ -307,6 +439,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return respond(await bridgeFetch(`/api/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/file?${params}`));
       }
       if (name === "github_download_file") {
+        assertResearchGate(name);
         if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode." }, true);
         const owner = String(args.owner || "").trim();
         const repo = String(args.repo || "").trim();
@@ -330,6 +463,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return respond({ ok: true, path: relPath(destination), bytes: buffer.length, source: payload.path });
       }
       if (name === "github_download_zip") {
+        assertResearchGate(name);
         if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled for this workspace." }, true);
         const owner = String(args.owner || "").trim();
         const repo = String(args.repo || "").trim();
@@ -356,6 +490,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return respond({ ok: true, path: relPath(destination), bytes: buffer.length });
       }
       if (name === "download_url") {
+        assertResearchGate(name);
         if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode." }, true);
         const url = String(args.url || "").trim();
         if (!/^https?:\/\//i.test(url)) return respond({ ok: false, error: "Only http(s) URLs are supported" }, true);
@@ -403,6 +538,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
       }
       if (name === "github_push_files") {
+        assertResearchGate(name);
         return respond(
           await bridgeFetch("/api/github/push", {
             method: "POST",

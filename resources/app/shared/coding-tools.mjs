@@ -386,6 +386,41 @@ export const codingTools = [
     },
   },
   {
+    name: "reference_search",
+    description:
+      "Search the user's indexed Reference Library: saved local folders, saved links and the text learned from them. Use this before assuming there is no local documentation for an API, engine or asset.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Keywords, API name, file name or topic to look up." },
+        limit: { type: "number", description: "Maximum matches (1-30, default 8)." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "reference_sources",
+    description:
+      "List the saved global reference folders, reference links and uploaded reference files, so you know which local context the user already indexed.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "reference_read",
+    description:
+      "Read one indexed reference entry (an indexed web page or a file inside a reference folder) by id, url or path. Call reference_search first to get the id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Index entry id returned by reference_search." },
+        url: { type: "string", description: "Exact indexed URL." },
+        path: { type: "string", description: "Exact indexed file path." },
+        maxChars: { type: "number", description: "Maximum characters to return (200-20000, default 8000)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "github_status",
     description: "Return the signed-in GitHub account, connection state and research settings.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -445,7 +480,7 @@ export const codingTools = [
   },
   {
     name: "github_read_file",
-    description: "Read a text file from a GitHub repository. Use github_repo_tree first to find the path.",
+    description: "Read a text file from a GitHub repository. List the repository tree first to find the exact path.",
     inputSchema: {
       type: "object",
       properties: {
@@ -461,7 +496,7 @@ export const codingTools = [
   {
     name: "github_download_file",
     description:
-      "Pull one file from a linked GitHub repository into the coding workspace, including binary assets. This is the GitHub pull operation for a single file. Use github_repo_tree/github_read_file to find the exact path first. Defaults to the file name in the workspace root.",
+      "Pull one file from a linked GitHub repository into the coding workspace, including binary assets. This is the GitHub pull operation for a single file. Use the repository tree and read-file tools to find the exact path first. Defaults to the file name in the workspace root.",
     inputSchema: {
       type: "object",
       properties: {
