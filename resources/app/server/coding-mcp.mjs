@@ -10,6 +10,7 @@ import { codingTools } from "../shared/coding-tools.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
 
 const ROOT = path.resolve(process.env.TWIX_CODING_ROOT || process.cwd());
+const APP_ROOT = process.env.TWIX_APP_ROOT ? path.resolve(process.env.TWIX_APP_ROOT) : "";
 const TRUSTED = process.env.TWIX_CODING_TRUSTED === "1";
 const UNITY_PORT = process.env.TWIX_UNITY_BRIDGE_PORT ? Number(process.env.TWIX_UNITY_BRIDGE_PORT) : null;
 const BRIDGE_URL = process.env.TWIX_BRIDGE_URL || "";
@@ -80,6 +81,65 @@ function relPath(target) {
 function isInsideRoot(target) {
   const rel = path.relative(ROOT, target);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function isInsidePath(base, target) {
+  const rel = path.relative(base, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function activePromptText() {
+  if (!RESEARCH_GATE_FILE) return "";
+  try {
+    const gate = JSON.parse(fssync.readFileSync(RESEARCH_GATE_FILE, "utf8"));
+    return String(gate?.prompt || "");
+  } catch {
+    return "";
+  }
+}
+
+function promptMentionsApp(prompt) {
+  return /(?:ai creator studio|3d creator studio|creator studio|twilight studio 3d|twilight studio)/i.test(
+    String(prompt || ""),
+  );
+}
+
+function assertAppTarget(target, action = "modify") {
+  if (!APP_ROOT || !TRUSTED) return;
+  if (isInsidePath(ROOT, APP_ROOT)) return;
+  if (!isInsidePath(APP_ROOT, target)) return;
+  if (promptMentionsApp(activePromptText())) return;
+  throw new Error(
+    "Creator Studio Safety blocked this " +
+      action +
+      ": your active workspace is " +
+      ROOT +
+      ", but the target is inside the Creator Studio app at " +
+      APP_ROOT +
+      ". Switch the Coding workspace to the app folder first, or ask explicitly for app changes.",
+  );
+}
+
+const APP_WRITE_INTENT =
+  /(?:^|[^<>])>{1,2}(?!\s*&)|\b(?:set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|set-item|del|erase|rmdir|rd|rm|mkdir|md|npm\s+(?:install|i|ci|run|uninstall)|pnpm|yarn|git\s+(?:commit|push|reset|clean|checkout|restore)|node\s+(?:scripts|[\w.-]+\.mjs)|npx|tsc|vite|electron)\b/i;
+
+function assertAppCommand(command, cwd) {
+  if (!APP_ROOT || !TRUSTED) return;
+  if (isInsidePath(ROOT, APP_ROOT)) return;
+  if (promptMentionsApp(activePromptText())) return;
+  if (!APP_WRITE_INTENT.test(String(command || ""))) return;
+  const targetsApp =
+    (cwd && isInsidePath(APP_ROOT, cwd)) ||
+    String(command || "").toLowerCase().includes(APP_ROOT.toLowerCase()) ||
+    String(command || "").toLowerCase().includes(APP_ROOT.replace(/\\/g, "/").toLowerCase());
+  if (!targetsApp) return;
+  throw new Error(
+    "Creator Studio Safety blocked this command: your active workspace is " +
+      ROOT +
+      ", but the command modifies the Creator Studio app at " +
+      APP_ROOT +
+      ". Switch the Coding workspace to the app folder first, or ask explicitly for app changes.",
+  );
 }
 
 function assertCommandScope(command) {
@@ -212,6 +272,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       assertResearchGate(name);
       if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode." }, true);
       const target = resolvePath(args.path);
+      assertAppTarget(target, "write " + relPath(target));
       await fs.mkdir(path.dirname(target), { recursive: true });
       const content = String(args.content ?? "");
       await fs.writeFile(target, content, "utf8");
@@ -286,6 +347,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } catch (error) {
           return respond({ ok: false, error: error.message }, true);
         }
+      }
+      try {
+        assertAppCommand(command, cwd);
+      } catch (error) {
+        return respond({ ok: false, blocked: true, denied: true, error: error.message }, true);
       }
       // Creator Studio command safety: classify before anything runs. A
       // dangerous command must be approved in the desktop UI; if the approval
@@ -377,14 +443,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (name === "reference_sources") {
         return respond(await bridgeFetch("/api/references"));
       }
-      if (name === "reference_search") {
+      if (
+        name === "reference_search" ||
+        name === "reference_search_local" ||
+        name === "reference_search_urls" ||
+        name === "reference_search_github"
+      ) {
         const query = String(args.query || "").trim();
         if (!query) return respond({ ok: false, error: "query is required" }, true);
         const limit = Math.max(1, Math.min(30, Number(args.limit ?? 8)));
+        const scope =
+          name === "reference_search_local"
+            ? "local"
+            : name === "reference_search_urls"
+              ? "url"
+              : name === "reference_search_github"
+                ? "github"
+                : String(args.scope || "all").toLowerCase();
         const payload = await bridgeFetch(
-          `/api/references/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+          `/api/references/search?q=${encodeURIComponent(query)}&limit=${limit}&scope=${encodeURIComponent(scope)}`,
         );
         return respond(payload, false);
+      }
+      if (name === "reference_status") {
+        return respond(await bridgeFetch("/api/references/status"));
+      }
+      if (name === "reference_index_source") {
+        assertResearchGate(name);
+        const kind = String(args.kind || "").toLowerCase();
+        const id = String(args.id || "").trim();
+        if (!["folder", "link"].includes(kind)) {
+          return respond({ ok: false, error: "kind must be folder or link" }, true);
+        }
+        if (!id) return respond({ ok: false, error: "id is required" }, true);
+        return respond(
+          await bridgeFetch("/api/references/index-source", {
+            method: "POST",
+            timeoutMs: 180000,
+            body: { kind, id },
+          }),
+        );
       }
       if (name === "reference_read") {
         const params = new URLSearchParams({
@@ -399,6 +497,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name.startsWith("github_") || name === "download_url") {
       if (name === "github_status") {
         return respond(await bridgeFetch("/api/github/status"));
+      }
+      if (name === "github_index_repo") {
+        assertResearchGate(name);
+        const owner = String(args.owner || "").trim();
+        const repo = String(args.repo || "").trim();
+        if (!owner || !repo) return respond({ ok: false, error: "owner and repo are required" }, true);
+        return respond(
+          await bridgeFetch("/api/github/index", {
+            method: "POST",
+            timeoutMs: 120000,
+            body: { owner, repo, force: Boolean(args.force) },
+          }),
+        );
       }
       if (name === "github_list_repos") {
         const limit = Math.max(1, Math.min(100, Number(args.limit ?? 40)));
@@ -455,6 +566,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return respond({ ok: false, error: "File is larger than the 25 MB workspace download limit." }, true);
         }
         const destination = resolvePath(args.destination || payload.name || path.basename(filePath));
+        assertAppTarget(destination, "download into " + relPath(destination));
         if (args.overwrite === false && fssync.existsSync(destination)) {
           return respond({ ok: false, error: relPath(destination) + " already exists" }, true);
         }
@@ -482,6 +594,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return respond({ ok: false, error: "Repository ZIP is larger than the 200 MB workspace limit." }, true);
         }
         const destination = resolvePath(args.destination || `${owner}-${repo}.zip`);
+        assertAppTarget(destination, "download into " + relPath(destination));
         if (args.overwrite === false && fssync.existsSync(destination)) {
           return respond({ ok: false, error: relPath(destination) + " already exists" }, true);
         }
@@ -497,6 +610,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const parsed = new URL(url);
         const fallbackName = decodeURIComponent(path.basename(parsed.pathname)) || "download.bin";
         const destination = resolvePath(args.path || fallbackName);
+        assertAppTarget(destination, "download into " + relPath(destination));
         if (args.overwrite === false && fssync.existsSync(destination)) {
           return respond({ ok: false, error: relPath(destination) + " already exists" }, true);
         }

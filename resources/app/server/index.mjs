@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLicenseService } from "./license.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
+import { createGithubIndex } from "./github-index.mjs";
 
 process.on("uncaughtException", (error) => {
   console.error("[TwiX] uncaughtException", error?.stack || error);
@@ -86,6 +87,25 @@ const LEGACY_DATA_DIRS = [
     : "",
 ].filter(Boolean);
 const PORT = Number(process.env.PORT || 4317);
+
+// Developer chat and profile cloud. The same ngrok server that hosts the
+// license database also hosts the BitBoy-compatible chat tables. Keeping the
+// credentials on the local server means the renderer never handles them.
+const CHAT_SERVER_URL = (
+  process.env.TWIX_CHAT_SERVER ||
+  process.env.TWIX_LICENSE_SERVER ||
+  "https://spearhead-versus-stimulant.ngrok-free.dev"
+).replace(/\/+$/, "");
+const CHAT_WS_URL =
+  process.env.TWIX_CHAT_WS || CHAT_SERVER_URL.replace(/^http/, "ws") + "/ws";
+const CHAT_SERVER_USER = process.env.TWIX_LICENSE_USER || "admin";
+const CHAT_SERVER_PASS = process.env.TWIX_LICENSE_PASS || "380112";
+const CHAT_TOKEN_TTL = 10 * 60 * 1000;
+const CHAT_CHANNEL_NAME = "CreatorStudio.Main";
+const CHAT_CHANNEL_ID = "global:CreatorStudio:CreatorStudio.Main";
+const CHAT_MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024;
+const CHAT_FILE_TTL_MS = 10 * 60 * 1000;
+let chatTokenCache = { token: "", at: 0 };
 const SERVE_DIST = process.argv.includes("--serve-dist");
 const BRIDGE_TOKEN = randomBytes(24).toString("hex");
 const MCP_SERVER = path.join(APP_ROOT, "server", "mcp-server.mjs");
@@ -1715,16 +1735,16 @@ ${dir}
 Trusted workspace: **${trusted ? "ON ? full PC access" : "OFF ? workspace read-only"}**.
 
 ## Rules
-1. Inspect the project before editing: \`coding_get_root\`, \`coding_list_files\`, \`coding_read_file\`, \`coding_search_files\`.
+1. Inspect the project before editing: \`coding_get_root\`, \`coding_list_files\`, \`coding_read_file\`, \`coding_search_files\`. If the active workspace contains AI_CHECKLIST.md, read it first and follow it.
 2. Make focused changes with \`coding_write_file\`. ${trusted ? "Trusted mode is on, so absolute paths and files outside the workspace are allowed when the user asks for them. Prefer the workspace for normal edits." : "Never write outside the workspace."}
 3. Use \`coding_run_command\` for builds, tests and shell work only when trusted workspace is on. ${trusted ? "Commands run with full user access and may reference any path on this PC." : ""}
 4. Explain file changes and command results clearly. Show errors and warnings in the response.
 5. Do not claim a build or test passed unless the command output confirms it.
-6. Keep the user's existing project structure and conventions. Do not overwrite unrelated files.
-7. GitHub is live and fully available through the coding_ prefixed tools: coding_github_status, coding_github_search_repositories, coding_github_search_code, coding_github_repo_tree, coding_github_read_file, coding_github_download_file, coding_github_download_zip. Use those exact names; a short name such as github_search_code does not exist in this session. Reference Library lookups use coding_reference_search, coding_reference_sources and coding_reference_read. Never say you cannot browse GitHub. Search public repositories, inspect full trees, read README/C#/source files, download exact files into the workspace, and log useful finds as references. Never push or post without the user asking.
+6. Keep the user's existing project structure and conventions. Do not overwrite unrelated files. The selected workspace above is the only project to edit; never edit, scan or run commands against the AI Creator Studio app folder or another project unless that folder is the selected workspace or the user explicitly asks for it in this prompt.
+7. GitHub is live and fully available through the coding_ prefixed tools: coding_github_status, coding_github_search_repositories, coding_github_search_code, coding_github_repo_tree, coding_github_read_file, coding_github_download_file, coding_github_download_zip. Use those exact names; a short name such as github_search_code does not exist in this session. Search the local Reference Library with coding_reference_search_local, saved URLs and documentation with coding_reference_search_urls, and repositories already indexed into Global Learning with coding_reference_search_github. Use coding_reference_status to check index freshness and coding_reference_index_source to re-index a saved folder or link. Open a match with coding_reference_read. Never say you cannot browse GitHub. Search public repositories, inspect full trees, read README/C#/source files, download exact files into the workspace, and log useful finds as references. Never push or post without the user asking.
 8. If the workspace is read-only, say what you would change and ask the user to enable trusted workspace.
 9. Work linearly: plan a short sequence, then complete one edit or command at a time. Do not spawn subagents or parallel tasks.
-10. Use GitHub proactively when related repositories, code, README files or assets would improve the result. Reference and session context are supporting background; ignore them only when irrelevant.
+10. Use GitHub proactively when related repositories, code, README files or assets would improve the result. Use coding_github_index_repo when a repository looks reusable so later prompts can find it in Global Learning. Reference and session context are supporting background; ignore them only when irrelevant.
 11. Recovery: a snapshot of the app source is saved before each prompt. If your edits stop the app or server from starting, run \`node scripts/recover-last.mjs\` to restore the latest snapshot, then reapply the intended change more carefully.
 12. Full refresh: after changing core app or server files, run \`node scripts/full-refresh.mjs\`. It reloads the window, restarts the supervised backend, and returns to the live Coding editor.
 ${unitySection}`;
@@ -1747,6 +1767,7 @@ async function writeCodingWorkspace(projectId, dir, trusted, unityPort = null) {
         timeout: 300000,
         environment: {
           TWIX_CODING_ROOT: dir,
+          TWIX_APP_ROOT: APP_ROOT,
           TWIX_CODING_TRUSTED: trusted ? "1" : "0",
           TWIX_UNITY_BRIDGE_PORT: unityPort ? String(unityPort) : "",
           TWIX_BRIDGE_URL: `http://127.0.0.1:${PORT}`,
@@ -2195,7 +2216,7 @@ app.get("/api/global-project/context", async (req, res) => {
   try {
     const query = String(req.query.q || "");
     const [globalLearning, references] = await Promise.all([
-      globalLearningContextFor(query),
+      globalLearningContextFor(query, String(req.query.workspace || "")),
       referenceContextFor(query),
     ]);
     const github = req.query.github === "1" ? await githubContextFor(query) : "";
@@ -2644,6 +2665,233 @@ app.post(
 );
 
 /* ------------------------------------------------------------------ */
+/* API: developer chat (BitBoy-compatible cloud tables)                */
+/* ------------------------------------------------------------------ */
+
+async function chatServerToken(force = false) {
+  if (!force && chatTokenCache.token && Date.now() - chatTokenCache.at < CHAT_TOKEN_TTL) {
+    return chatTokenCache.token;
+  }
+  const response = await fetch(CHAT_SERVER_URL + "/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+    body: JSON.stringify({ username: CHAT_SERVER_USER, password: CHAT_SERVER_PASS }),
+    signal: AbortSignal.timeout(12000),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data?.token) {
+    throw new Error("Chat server login failed (HTTP " + response.status + ").");
+  }
+  chatTokenCache = { token: String(data.token), at: Date.now() };
+  return chatTokenCache.token;
+}
+
+async function chatServerFetch(pathname, options = {}) {
+  let token = await chatServerToken();
+  const call = (bearer) =>
+    fetch(CHAT_SERVER_URL + pathname, {
+      method: options.method || "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true",
+        ...(bearer ? { Authorization: "Bearer " + bearer } : {}),
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: AbortSignal.timeout(options.timeoutMs || 20000),
+    });
+  let response = await call(token);
+  if (response.status === 401 || response.status === 403) {
+    token = await chatServerToken(true);
+    response = await call(token);
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data?.error || "Chat server HTTP " + response.status);
+  return data;
+}
+
+app.get("/api/chat/config", (req, res) => {
+  res.json({
+    ok: true,
+    serverUrl: CHAT_SERVER_URL,
+    wsUrl: CHAT_WS_URL,
+    channel: CHAT_CHANNEL_NAME,
+    channelId: CHAT_CHANNEL_ID,
+    fileTtlMs: CHAT_FILE_TTL_MS,
+    maxFileBytes: CHAT_MAX_FILE_BYTES,
+    defaultBandwidthKbps: 4096,
+  });
+});
+
+async function ensureChatChannel() {
+  const data = await chatServerFetch("/api/bitboy_chat_channels");
+  const records = data.records || {};
+  const found = Object.entries(records).find(([id, channel]) => {
+    const name = String(channel.n || channel.name || "").toLowerCase();
+    return id === CHAT_CHANNEL_ID || name === CHAT_CHANNEL_NAME.toLowerCase();
+  });
+  if (found) {
+    const [id, channel] = found;
+    return {
+      id: channel.id || channel.__id || id,
+      name: channel.n || channel.name || CHAT_CHANNEL_NAME,
+      type: channel.t || channel.type || "global",
+      server: channel.sv || channel.server || "CreatorStudio",
+      description: channel.d || channel.desc || "Creator Studio developer chat and direct file transfer",
+      position: Number(channel.pos || 0),
+    };
+  }
+  const created = await chatServerFetch("/api/bitboy_chat_channels", {
+    method: "POST",
+    body: {
+      id: CHAT_CHANNEL_ID,
+      n: CHAT_CHANNEL_NAME,
+      t: "global",
+      sv: "CreatorStudio",
+      d: "Creator Studio developer chat and direct file transfer",
+      pos: 0,
+    },
+  });
+  return {
+    id: created.id || created.__id || CHAT_CHANNEL_ID,
+    name: created.n || CHAT_CHANNEL_NAME,
+    type: created.t || "global",
+    server: created.sv || "CreatorStudio",
+    description: created.d || "Creator Studio developer chat and direct file transfer",
+    position: 0,
+  };
+}
+
+app.get("/api/chat/channels", async (req, res) => {
+  try {
+    const channel = await ensureChatChannel();
+    // Creator Studio has exactly one channel. BitBoy's public and review
+    // channels stay on the server but are never shown in this applet.
+    res.json({ ok: true, channels: [channel] });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.get("/api/chat/messages", async (req, res) => {
+  try {
+    const channel = String(req.query.channel || CHAT_CHANNEL_ID).trim();
+    if (!channel) return res.status(400).json({ error: "channel is required" });
+    const before = String(req.query.before || "").trim();
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 15)));
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (before) params.set("before", before);
+    else params.set("newest", "1");
+    const data = await chatServerFetch(
+      "/api/channels/" + encodeURIComponent(channel) + "/messages?" + params.toString(),
+    );
+    const primary = Array.isArray(data.messages) ? data.messages : [];
+    // Older builds wrote chat messages to the generic messages table. Merge
+    // those rows too so files and text from before the fix still appear in
+    // history after a relaunch.
+    let legacy = [];
+    try {
+      const old = await chatServerFetch(
+        "/api/messages?channel=" + encodeURIComponent(channel) + "&newest=1&limit=100",
+      );
+      legacy = Object.values(old?.records || {});
+    } catch {}
+    const merged = new Map();
+    const add = (message) => {
+      if (!message) return;
+      const user = String(message.u || message.user || "").toLowerCase();
+      const senderPid = String(message.pid || "").toLowerCase();
+      // Test probes and temporary automation accounts are never real members.
+      if (
+        user === "probe" ||
+        user === "codextest" ||
+        user === "test" ||
+        user.startsWith("test-") ||
+        senderPid === "probe-pid" ||
+        senderPid === "test-pid"
+      ) {
+        return;
+      }
+      const id = String(message.id || message.__id || "");
+      const key =
+        id ||
+        String(message.u || "") + "|" + String(message.m || message.msg || "") + "|" + String(message.i || message.idx || message.ts || "");
+      if (!key || merged.has(key)) return;
+      merged.set(key, {
+        ...message,
+        id: id || key,
+        idx: message.idx || message.i,
+        ts: message.ts || (typeof message.t === "number" ? message.t : undefined),
+      });
+    };
+    for (const message of primary) add(message);
+    for (const message of legacy) add(message);
+    const sorted = [...merged.values()].sort(
+      (a, b) => Number(a.idx || a.i || a.ts || 0) - Number(b.idx || b.i || b.ts || 0),
+    );
+    const beforeCursor = String(req.query.before || "").trim();
+    const filtered = beforeCursor
+      ? sorted.filter((message) => Number(message.idx || message.i || message.ts || 0) < Number(beforeCursor))
+      : sorted;
+    const messages = filtered.slice(-limit);
+    res.json({ ok: true, channel, messages, count: messages.length });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/chat/send", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const channel = String(body.channel || body.ch || "").trim();
+    const username = String(body.username || body.u || "").trim();
+    if (!channel) return res.status(400).json({ error: "channel is required" });
+    if (!username) return res.status(400).json({ error: "username is required" });
+    const payload = {
+      ch: channel,
+      i: Number(body.idx || body.i || Date.now()),
+      u: username,
+      pid: String(body.pid || ""),
+      t: String(body.kind || body.t || "msg"),
+      m: String(body.message || body.m || ""),
+    };
+    for (const key of ["kind", "to", "file", "signal", "avatar", "name", "border", "font", "gradient", "effect", "expiresAt"]) {
+      if (body[key] !== undefined) payload[key] = body[key];
+    }
+    // The channel history endpoint reads bitboy_chat_messages, so persist there.
+    // /api/messages is a different table and its rows never appear in history.
+    const data = await chatServerFetch("/api/bitboy_chat_messages", { method: "POST", body: payload });
+    res.json({ ok: true, message: data });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.get("/api/chat/profiles", async (req, res) => {
+  try {
+    const data = await chatServerFetch("/api/creator_chat_profiles");
+    res.json({ ok: true, profiles: Object.values(data.records || {}) });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/chat/profiles", async (req, res) => {
+  try {
+    const profile = req.body || {};
+    const id = String(profile.id || profile.u || "").trim();
+    if (!id) return res.status(400).json({ error: "id or username is required" });
+    const data = await chatServerFetch("/api/creator_chat_profiles", {
+      method: "POST",
+      body: { ...profile, id },
+    });
+    res.json({ ok: true, profile: data });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* API: coding workspace                                               */
 /* ------------------------------------------------------------------ */
 
@@ -2747,11 +2995,31 @@ app.post("/api/coding/chat", async (req, res) => {
     } = req.body || {};
     if (!projectId || !dir) return res.status(400).json({ error: "projectId and dir are required" });
     if (!text || !String(text).trim()) return res.status(400).json({ error: "Prompt is empty" });
+    const requestedRoot = resolveCodingRoot(dir);
     let state = codingServers.get(projectId);
-    if (!state) {
-      state = await startCodingServer(projectId, dir, Boolean(trusted), false, unityPort ? Number(unityPort) : null);
+    let rootChanged = false;
+    if (state && (state.root !== requestedRoot || state.trusted !== Boolean(trusted))) {
+      state = await startCodingServer(
+        projectId,
+        requestedRoot,
+        Boolean(trusted),
+        true,
+        unityPort ? Number(unityPort) : null,
+      );
+      rootChanged = true;
     }
-    let sid = sessionId;
+    if (!state) {
+      state = await startCodingServer(
+        projectId,
+        requestedRoot,
+        Boolean(trusted),
+        false,
+        unityPort ? Number(unityPort) : null,
+      );
+    }
+    // A restarted OpenCode server is a new project scope; the previous session
+    // id belongs to the old workspace and must not be reused.
+    let sid = rootChanged ? null : sessionId;
     if (!sid) {
       const session = await ocFetch(state, "/session", {
         method: "POST",
@@ -2767,14 +3035,15 @@ app.post("/api/coding/chat", async (req, res) => {
     const research = await preflightResearch(text);
     const referenceContext = research.referenceText;
     const githubContext = research.githubText;
-    const globalContext = await globalLearningContextFor(text);
+    const globalContext = await globalLearningContextFor(text, state.root);
     const sessionContext = await sessionContextFor(state, text);
     const baseSystem = [
       "You are the coding and Unity agent for AI Creator Studio.",
       knowledgeInstructions,
       globalContext,
-      `Workspace root: ${state.root}`,
+      `Active workspace (the only project to edit): ${state.root}`,
       `Trusted workspace: ${state.trusted ? "ON - full PC access" : "OFF"}`,
+      `Never edit, scan or run commands against the AI Creator Studio application folder (${APP_ROOT}) or any other project unless it is the active workspace or the user explicitly asks in this prompt.`,
       state.unityPort ? `Unity bridge port: ${state.unityPort}` : "Unity bridge is not connected.",
       "Use coding_* tools for files and commands. Use unity_* tools for Unity state, compile, focus, refresh, play and stop when available.",
       "Work mainly in the selected workspace. Work linearly, one edit or command at a time. Report build/compile results honestly.",
@@ -2964,7 +3233,16 @@ app.get("/api/research/preflight", async (req, res) => {
 app.post("/api/coding/prompt", async (req, res) => {
   try {
     const { projectId, sessionId, text, model, dir, trusted, images = [], githubRepo = null } = req.body || {};
-    const state = codingServers.get(projectId);
+    const requestedRoot = dir ? resolveCodingRoot(dir) : null;
+    let state = codingServers.get(projectId);
+    let rootChanged = false;
+    if (state && requestedRoot) {
+      const nextTrusted = trusted === undefined ? state.trusted : Boolean(trusted);
+      if (state.root !== requestedRoot || state.trusted !== nextTrusted) {
+        state = await startCodingServer(projectId, requestedRoot, nextTrusted, true, state.unityPort || null);
+        rootChanged = true;
+      }
+    }
     if (!state) return res.status(400).json({ error: "Coding workspace is not connected" });
     let recovery = null;
     try {
@@ -2986,9 +3264,9 @@ app.post("/api/coding/prompt", async (req, res) => {
         : "No GitHub repository is linked in the coding sidebar. If the workspace already has a .git/config remote, inspect it before assuming there is none; otherwise do not push or pull until the user links one.",
       "GitHub safety: files over 25 MB and batches over 50 MB are blocked before GitHub can lock the repository. Never push binary textures or audio through coding_github_push_files; use coding_github_download_file or coding_download_url to bring assets into the workspace, then commit small text changes.",
       "GitHub awareness: use coding_github_search_code, coding_github_search_repositories, coding_github_repo_tree and coding_github_read_file (exact names) to inspect repositories. Pull exact files with coding_github_download_file. Use coding_download_url only when the user asks for an external asset download.",
-      "Reference Library: coding_reference_search searches the user's indexed folders and links, coding_reference_sources lists them and coding_reference_read opens one entry. Use these before assuming there is no local documentation.",
+      "Reference Library: coding_reference_search_local searches indexed folders and files, coding_reference_search_urls searches saved documentation, coding_reference_search_github searches repositories already indexed into Global Learning, coding_reference_status reports coverage and coding_reference_index_source re-indexes a saved folder or link. Use coding_reference_read to open a match before assuming there is no local documentation.",
     ].join("\n");
-    let sid = sessionId;
+    let sid = rootChanged ? null : sessionId;
     if (!sid) {
       const session = await ocFetch(state, "/session", { method: "POST", body: JSON.stringify({ title: codingSessionTitle(text) || "Coding session" }) });
       sid = session.id;
@@ -3004,14 +3282,15 @@ app.post("/api/coding/prompt", async (req, res) => {
     const research = await preflightResearch(text || "");
     const referenceContext = research.referenceText;
     const githubContext = research.githubText;
-    const globalContext = await globalLearningContextFor(text || "");
+    const globalContext = await globalLearningContextFor(text || "", state.root);
     const sessionContext = await sessionContextFor(state, text || "");
     const system = [
       "You are the coding agent for AI Creator Studio.",
       knowledgeInstructions,
       globalContext,
-      `Workspace root: ${state.root}`,
+      `Active workspace (the only project to edit): ${state.root}`,
       `Trusted workspace: ${state.trusted ? "ON - full PC access" : "OFF"}`,
+      `Never edit, scan or run commands against the AI Creator Studio application folder (${APP_ROOT}) or any other project unless it is the active workspace or the user explicitly asks in this prompt.`,
       "Use coding_* tools only. Work mainly in the selected workspace, linearly, one edit or command at a time. Report build/test results honestly.",
       "The Pre-flight research briefing below already ran for this prompt. Consult it before your first coding_write_file or coding_run_command. The MCP research gate blocks writes and commands when no fresh briefing exists.",
       research.briefing,
@@ -4141,13 +4420,27 @@ function stripHtml(html) {
 }
 
 async function loadReferenceIndex() {
-  return readJson(REFERENCE_INDEX_FILE(), { updatedAt: null, entries: [] });
+  const index = await readJson(REFERENCE_INDEX_FILE(), { updatedAt: null, entries: [] });
+  try {
+    const github = await loadGithubIndex();
+    const githubEntries = githubReferenceEntries(github);
+    if (!githubEntries.length) return index;
+    const known = new Set((index.entries || []).map((entry) => entry.id));
+    const extra = githubEntries.filter((entry) => !known.has(entry.id));
+    if (!extra.length) return index;
+    return { ...index, entries: [...extra, ...(index.entries || [])] };
+  } catch {
+    return index;
+  }
 }
 
 // The index is rebuilt automatically at app load and after a source changes.
 // A signature of the saved folders/links makes that cheap: an index that
 // already matches the sources is reused instead of re-crawled.
 const REFERENCE_INDEX_TTL = 10 * 60 * 1000;
+// Folder trees can be huge. Keep a generous overall cap but reserve room for
+// URL entries so a large asset library can never push documentation out.
+const REFERENCE_INDEX_MAX_ENTRIES = 8000;
 
 function referenceSourceSignature(settings) {
   const folders = (settings.references?.folders || [])
@@ -4211,32 +4504,41 @@ function scheduleReferenceIndex(delayMs = 1200, force = false) {
 }
 
 /** Re-index a single link or folder right after it is added. */
+async function refreshReferenceSource(kind, id) {
+  if (!id) throw new Error("A source id is required");
+  return runReferenceIndexJob(async () => {
+    const settings = await getSettings();
+    const index = await loadReferenceIndex();
+    const kept = (index.entries || []).filter((entry) => entry.sourceId !== id);
+    const added = [];
+    if (kind === "folder") {
+      const folder = (settings.references?.folders || []).find((item) => item.id === id);
+      if (folder) await scanReferenceFolder(folder, added);
+    } else if (kind === "link") {
+      const link = (settings.references?.links || []).find((item) => item.id === id);
+      if (link) await scanReferenceLink(link, added, 1);
+    } else {
+      throw new Error("kind must be folder or link");
+    }
+    const next = {
+      updatedAt: new Date().toISOString(),
+      signature: referenceSourceSignature(settings),
+      entries: [...kept, ...added].slice(0, REFERENCE_INDEX_MAX_ENTRIES),
+    };
+    await writeReferenceIndex(next);
+    log("info", "references", "source re-indexed", { kind, id, added: added.length, count: next.entries.length });
+    return { ok: true, kind, id, added: added.length, count: next.entries.length, updatedAt: next.updatedAt };
+  });
+}
+
+/** Re-index a single link or folder right after it is added. */
 function scheduleReferenceSourceRefresh(kind, id) {
   if (!id) return;
   const key = kind + ":" + id;
   if (referenceSourceTimers.has(key)) clearTimeout(referenceSourceTimers.get(key));
   const timer = setTimeout(() => {
     referenceSourceTimers.delete(key);
-    void runReferenceIndexJob(async () => {
-      const settings = await getSettings();
-      const index = await loadReferenceIndex();
-      const kept = (index.entries || []).filter((entry) => entry.sourceId !== id);
-      const added = [];
-      if (kind === "folder") {
-        const folder = (settings.references?.folders || []).find((item) => item.id === id);
-        if (folder) await scanReferenceFolder(folder, added);
-      } else if (kind === "link") {
-        const link = (settings.references?.links || []).find((item) => item.id === id);
-        if (link) await scanReferenceLink(link, added, 1);
-      }
-      const next = {
-        updatedAt: new Date().toISOString(),
-        signature: referenceSourceSignature(settings),
-        entries: [...kept, ...added].slice(0, 5000),
-      };
-      await writeReferenceIndex(next);
-      log("info", "references", "source re-indexed", { kind, id, added: added.length, count: next.entries.length });
-    }).catch((error) => {
+    void refreshReferenceSource(kind, id).catch((error) => {
       log("warning", "references", "source re-index failed", { kind, id, message: error.message });
     });
   }, 900);
@@ -4259,7 +4561,7 @@ function scheduleReferenceIndexCleanup(sourceId) {
   }).catch(() => {});
 }
 
-async function scanReferenceFolder(folder, entries) {
+async function scanReferenceFolder(folder, entries, maxEntries = 2000) {
   const root = path.resolve(folder.path);
   if (!fssync.existsSync(root) || !fssync.statSync(root).isDirectory()) return;
   entries.push({
@@ -4275,9 +4577,9 @@ async function scanReferenceFolder(folder, entries) {
   });
   let count = 0;
   const walk = async (dir, depth) => {
-    if (depth > 4 || count > 2000) return;
+    if (depth > 4 || count > maxEntries) return;
     for (const name of await fs.readdir(dir).catch(() => [])) {
-      if (count > 2000) break;
+      if (count > maxEntries) break;
       if (name.startsWith(".") || name === "node_modules") continue;
       const target = path.join(dir, name);
       const stat = await fs.stat(target).catch(() => null);
@@ -4313,6 +4615,26 @@ async function scanReferenceFolder(folder, entries) {
   await walk(root, 0);
 }
 
+function pushLinkFallback(url, link, label, depth, entries) {
+  const id = "url:" + url;
+  if (entries.some((entry) => entry.id === id)) return;
+  const title = stripHtml(label || link.label || url).slice(0, 180);
+  entries.push({
+    id,
+    type: "url",
+    sourceId: link.id,
+    title,
+    url,
+    linkId: link.id,
+    linkLabel: link.label,
+    keywords: tokenizeReference(link.label + " " + title + " " + url),
+    summary: "Saved reference link: " + (link.label || url),
+    text: (link.label || "") + " " + title + " " + url,
+    depth,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
 async function scanReferenceLink(link, entries, maxDepth = 1) {
   const visited = new Set();
   let count = 0;
@@ -4326,8 +4648,15 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
       });
       if (!response.ok) return;
       const type = response.headers.get("content-type") || "";
-      if (!type.includes("text/html") && !type.includes("text/plain")) return;
+      if (type && !type.includes("text/html") && !type.includes("text/plain") && !type.includes("xhtml")) {
+        pushLinkFallback(url, link, label, depth, entries);
+        return;
+      }
       const html = (await response.text()).slice(0, 900000);
+      if (!type && !/<(?:html|body|head|p|div)[\s>]/i.test(html.slice(0, 2000))) {
+        pushLinkFallback(url, link, label, depth, entries);
+        return;
+      }
       const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
       const descriptionMatch = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
       const text = stripHtml(html).slice(0, 12000);
@@ -4356,7 +4685,9 @@ async function scanReferenceLink(link, entries, maxDepth = 1) {
         .filter((next, index, all) => all.indexOf(next) === index)
         .slice(0, 8);
       for (const next of links) await crawl(next, depth - 1, title);
-    } catch {}
+    } catch {
+      pushLinkFallback(url, link, label, depth, entries);
+    }
   };
   await crawl(link.url, Math.max(0, Math.min(2, maxDepth)), link.label);
 }
@@ -4380,7 +4711,7 @@ async function writeReferenceIndex(index) {
     "",
     "Generated " + index.updatedAt,
     "",
-    ...index.entries.slice(0, 5000).map((entry) => {
+    ...index.entries.slice(0, 8000).map((entry) => {
       const location = entry.url || entry.path || "";
       return "- [" + entry.type + "] **" + entry.title + "** - " + location + "\n  " + (entry.summary || "");
     }),
@@ -4390,15 +4721,22 @@ async function writeReferenceIndex(index) {
 
 async function scanReferenceSources(settingsOverride) {
   const settings = settingsOverride || (await getSettings());
-  const entries = [];
   const folders = settings.references?.folders || [];
   const links = settings.references?.links || [];
-  for (const folder of folders) await scanReferenceFolder(folder, entries);
-  await scanLinksConcurrently(links, entries);
+  const folderEntries = [];
+  // Share the folder budget across every saved folder, so one enormous Unity
+  // library cannot hide the smaller folders.
+  const perFolder = Math.max(200, Math.min(2000, Math.floor(6000 / Math.max(1, folders.length))));
+  for (const folder of folders) await scanReferenceFolder(folder, folderEntries, perFolder);
+  const linkEntries = [];
+  await scanLinksConcurrently(links, linkEntries);
+  // URL entries go first: they are the smallest and most frequently lost when
+  // the overall cap is applied to a folder-heavy index.
+  const entries = [...linkEntries, ...folderEntries];
   const index = {
     updatedAt: new Date().toISOString(),
     signature: referenceSourceSignature(settings),
-    entries: entries.slice(0, 5000),
+    entries: entries.slice(0, REFERENCE_INDEX_MAX_ENTRIES),
   };
   await writeReferenceIndex(index);
   return index;
@@ -4414,7 +4752,7 @@ async function scanReferenceLinksOnly() {
   const index = {
     updatedAt: new Date().toISOString(),
     signature: referenceSourceSignature(settings),
-    entries: [...kept, ...entries].slice(0, 5000),
+    entries: [...kept, ...entries].slice(0, REFERENCE_INDEX_MAX_ENTRIES),
   };
   await writeReferenceIndex(index);
   return { index, links: links.length, urlEntries: entries.length };
@@ -4585,15 +4923,44 @@ async function globalFileText(file) {
   }
 }
 
-async function globalLearningContextFor(query) {
+function normalizeWorkspace(value) {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+async function globalFileWorkspace(file) {
+  if (!/\.json$/i.test(file.name)) return "";
+  try {
+    const data = JSON.parse(await fs.readFile(file.path, "utf8"));
+    return String(data.workspace || data.root || data.projectPath || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+// A learning entry without a workspace is global knowledge (research, reference
+// notes). An entry that names another workspace must never be injected into a
+// prompt for a different project.
+async function globalFileMatchesWorkspace(file, workspace) {
+  const active = normalizeWorkspace(workspace);
+  if (!active) return true;
+  const recorded = normalizeWorkspace(await globalFileWorkspace(file));
+  if (!recorded) return true;
+  return recorded === active || recorded.startsWith(active + "/") || active.startsWith(recorded + "/");
+}
+
+async function globalLearningContextFor(query, workspace = "") {
   try {
     const terms = tokenizeReference(query).filter((term) => term.length > 2).slice(0, 10);
-    const cacheKey = terms.join("|") || "__recent__";
+    const cacheKey = (normalizeWorkspace(workspace) || "global") + "|" + (terms.join("|") || "__recent__");
     const cached = globalLearningContextCache.get(cacheKey);
     if (cached && Date.now() - cached.at < 30000) return cached.text;
     const files = await listRecentGlobalFiles();
     const hits = [];
     for (const file of files.slice(0, 140)) {
+      if (!(await globalFileMatchesWorkspace(file, workspace))) continue;
       const text = await globalFileText(file);
       const haystack = (file.name + " " + text).toLowerCase();
       const score = terms.reduce((total, term) => total + (haystack.includes(term) ? 1 : 0), 0);
@@ -4623,7 +4990,11 @@ async function globalLearningContextFor(query) {
         ...(Array.isArray(meta?.contextNotes) ? meta.contextNotes.slice(-5) : []),
         ...(Array.isArray(meta?.importNotes) ? meta.importNotes.slice(-3) : []),
       ].filter(Boolean);
-      if (notes.length) lines.push("", "Recent project context: " + notes.join(" | ").slice(0, 1400));
+      const globalRootActive =
+        !workspace || normalizeWorkspace(workspace) === normalizeWorkspace(GLOBAL_PROJECT_ROOT);
+      if (notes.length && globalRootActive) {
+        lines.push("", "Recent project context: " + notes.join(" | ").slice(0, 1400));
+      }
     } catch {}
     const text = lines.join("\n").slice(0, 6000);
     globalLearningContextCache.set(cacheKey, { at: Date.now(), text });
@@ -4678,10 +5049,15 @@ function researchTerms(input, limit = 12) {
   return out;
 }
 
+const REFERENCE_SCOPE_TYPES = {
+  local: ["folder", "file", "upload"],
+  url: ["url"],
+  github: ["github-repo", "github-file"],
+};
+
 async function referencePreflight(text, limit = 10) {
   try {
     const index = await loadReferenceIndex();
-    const matches = searchReferenceEntries(index, text, limit, { strict: true });
     const updatedAt = index.updatedAt || null;
     const age = updatedAt ? Date.now() - new Date(updatedAt).getTime() : Infinity;
     const stale = !Number.isFinite(age) || age > REFERENCE_INDEX_TTL;
@@ -4689,9 +5065,38 @@ async function referencePreflight(text, limit = 10) {
     // trust a cold index. Search what exists and top the index up in the
     // background for the next prompt.
     if (stale) scheduleReferenceIndex(400);
-    return { updatedAt, total: index.entries?.length || 0, matches, stale };
+    const entries = index.entries || [];
+    const counts = {
+      total: entries.length,
+      local: entries.filter((entry) => REFERENCE_SCOPE_TYPES.local.includes(entry.type)).length,
+      url: entries.filter((entry) => REFERENCE_SCOPE_TYPES.url.includes(entry.type)).length,
+      github: entries.filter((entry) => REFERENCE_SCOPE_TYPES.github.includes(entry.type)).length,
+    };
+    const search = (types, max) => {
+      const scoped = { ...index, entries: entries.filter((entry) => types.includes(entry.type)) };
+      const strict = searchReferenceEntries(scoped, text, max, { strict: true });
+      // Strict ranking avoids noise, but a prompt can legitimately match a
+      // folder or page with only common words. Fall back to the permissive
+      // ranking for that category instead of reporting nothing.
+      if (strict.length) return strict;
+      return searchReferenceEntries(scoped, text, Math.max(2, Math.min(max, 4)));
+    };
+    const local = search(REFERENCE_SCOPE_TYPES.local, 6);
+    const urls = search(REFERENCE_SCOPE_TYPES.url, 4);
+    const github = search(REFERENCE_SCOPE_TYPES.github, 4);
+    const matches = [...local, ...urls, ...github].slice(0, Math.max(1, limit));
+    return { updatedAt, total: counts.total, counts, matches, local, urls, github, stale };
   } catch {
-    return { updatedAt: null, total: 0, matches: [], stale: true };
+    return {
+      updatedAt: null,
+      total: 0,
+      counts: { total: 0, local: 0, url: 0, github: 0 },
+      matches: [],
+      local: [],
+      urls: [],
+      github: [],
+      stale: true,
+    };
   }
 }
 
@@ -4778,43 +5183,97 @@ async function githubPreflight(text) {
       if (summary.code.length >= 6) break;
     }
   }
+  for (const repo of summary.repositories.slice(0, 2)) {
+    const [owner, name] = String(repo.full_name || "").split("/");
+    if (owner && name) void rememberGithubRepo(owner, name, { source: "preflight" });
+  }
   return summary;
 }
+
+const githubKnowledge = createGithubIndex({
+  path,
+  readJson,
+  writeJsonAtomic,
+  ensureDir,
+  DATA_DIR,
+  GLOBAL_PROJECT_ROOT,
+  safeName,
+  tokenizeReference,
+  githubApi,
+  githubRepoApi,
+  log,
+});
+const { loadGithubIndex, githubReferenceEntries, rememberGithubRepo, rememberGithubFile } = githubKnowledge;
 
 function buildPreflightBriefing(text, local, remote, elapsedMs) {
   const lines = [
     "# Pre-flight research (already completed for this prompt)",
-    "The studio ran these searches before you were called. Read this briefing before your first command, file write or file edit.",
+    "The studio searched the local Reference Library, the URL/documentation index, the GitHub knowledge index and public GitHub before you were called. Read this briefing before your first command, file write or file edit.",
   ];
   const counts = {
     references: local.matches.length,
     referenceIndexEntries: local.total,
+    localMatches: local.local?.length || 0,
+    urlMatches: local.urls?.length || 0,
+    githubKnowledgeMatches: local.github?.length || 0,
     repositories: remote.repositories.length,
     code: remote.code.length,
   };
-  if (local.matches.length) {
-    lines.push("", `## Local Reference Library (${local.matches.length} of ${local.total} indexed entries)`);
-    for (const entry of local.matches.slice(0, 8)) {
+  lines.push(
+    "",
+    "## Index coverage",
+    "- Local folder/file entries: " + (local.counts?.local ?? 0) + " (" + (local.local?.length || 0) + " matched)",
+    "- URL/documentation entries: " + (local.counts?.url ?? 0) + " (" + (local.urls?.length || 0) + " matched)",
+    "- Indexed GitHub knowledge entries: " + (local.counts?.github ?? 0) + " (" + (local.github?.length || 0) + " matched)",
+  );
+  const section = (title, entries, hint) => {
+    if (!entries?.length) {
+      lines.push("", "## " + title, "No indexed entry matched this prompt's keywords.");
+      return;
+    }
+    lines.push("", "## " + title + " (" + entries.length + " matches)");
+    for (const entry of entries.slice(0, 6)) {
       const location = entry.url || entry.path || "";
-      lines.push(`- [${entry.type}] ${entry.title} - ${location} (id: ${entry.id})`);
+      lines.push("- [" + entry.type + "] " + entry.title + " - " + location + " (id: " + entry.id + ")");
       if (entry.summary) lines.push("  " + String(entry.summary).replace(/\s+/g, " ").slice(0, 240));
     }
-    lines.push("Open any match with coding_reference_read (pass its id) before you write code.");
-  } else {
-    lines.push("", "## Local Reference Library", "No indexed link or folder entry matched this prompt.");
-  }
+    if (hint) lines.push(hint);
+  };
+  section(
+    "Local folder and file matches",
+    local.local,
+    "Open a match with coding_reference_read (pass its id) before you write code.",
+  );
+  section(
+    "URL and documentation matches",
+    local.urls,
+    "Open a match with coding_reference_read (pass its id) before relying on it.",
+  );
+  section(
+    "GitHub knowledge index matches",
+    local.github,
+    "These repositories or files were indexed earlier from Global Learning. Open one with coding_reference_read before downloading it again.",
+  );
   if (local.stale) {
     lines.push(
+      "",
       "The reference index is cold or older than " +
         Math.round(REFERENCE_INDEX_TTL / 60000) +
         " minutes; a background refresh was queued for the next prompt.",
     );
   }
   if (remote.repositories.length) {
-    lines.push("", `## GitHub repositories (${remote.repositories.length} matches)`);
+    lines.push("", "## GitHub repositories (" + remote.repositories.length + " matches)");
     for (const repo of remote.repositories) {
       lines.push(
-        `- ${repo.full_name} (${repo.stars} stars${repo.language ? ", " + repo.language : ""}) - ${repo.url}` +
+        "- " +
+          repo.full_name +
+          " (" +
+          repo.stars +
+          " stars" +
+          (repo.language ? ", " + repo.language : "") +
+          ") - " +
+          repo.url +
           (repo.description ? " - " + String(repo.description).replace(/\s+/g, " ").slice(0, 180) : ""),
       );
     }
@@ -4822,9 +5281,9 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
     lines.push("", "## GitHub repositories", "No public repository matched this prompt's keywords.");
   }
   if (remote.code.length) {
-    lines.push("", `## GitHub code (${remote.code.length} matches)`);
+    lines.push("", "## GitHub code (" + remote.code.length + " matches)");
     for (const hit of remote.code) {
-      lines.push(`- ${hit.repo}/${hit.path} - ${hit.url}`);
+      lines.push("- " + hit.repo + "/" + hit.path + " - " + hit.url);
       if (hit.fragment) lines.push("  " + hit.fragment.slice(0, 220));
     }
     lines.push("Inspect a match with coding_github_repo_tree and coding_github_read_file before implementing.");
@@ -4835,12 +5294,14 @@ function buildPreflightBriefing(text, local, remote, elapsedMs) {
   lines.push(
     "",
     "## Required use",
-    "- If a local reference matches, open it (coding_reference_read) before editing.",
-    "- If a GitHub repository or file matches, inspect it (coding_github_repo_tree / coding_github_read_file) before inventing an implementation.",
+    "- Search the local Reference Library with coding_reference_search_local and the URL index with coding_reference_search_urls before inventing an implementation.",
+    "- Search the GitHub knowledge index with coding_reference_search_github, and use coding_github_repo_tree / coding_github_read_file for live repository inspection.",
+    "- Open a matching local or URL entry with coding_reference_read (pass its id) before editing.",
+    "- If a folder, link or repository is missing from the index, use coding_reference_index_source or coding_github_index_repo to add it, then search again.",
     "- Mention the reference id or repository path you used in your summary. If nothing matched, say so and work from the project itself.",
-    `- Research took ${elapsedMs} ms.`,
+    "- Research took " + elapsedMs + " ms.",
   );
-  return { briefing: lines.join("\n").slice(0, 9500), counts };
+  return { briefing: lines.join("\n").slice(0, 12000), counts };
 }
 
 async function preflightResearch(text) {
@@ -4865,10 +5326,16 @@ async function preflightResearch(text) {
   }
   const composed = buildPreflightBriefing(query, local, remote, Date.now() - started);
   const referenceText = local.matches.length
-    ? "Reference index matches (local folders and links):\n" +
-      local.matches
-        .map((entry) => "- " + entry.type + ": " + entry.title + " - " + (entry.url || entry.path || ""))
-        .join("\n")
+    ? "Reference index matches:\n" +
+      [
+        ...(local.local || []).map(
+          (entry) => "- [local] " + entry.type + ": " + entry.title + " - " + (entry.url || entry.path || ""),
+        ),
+        ...(local.urls || []).map((entry) => "- [url] " + entry.title + " - " + (entry.url || "")),
+        ...(local.github || []).map(
+          (entry) => "- [github] " + entry.type + ": " + entry.title + " - " + (entry.url || entry.path || ""),
+        ),
+      ].join("\n")
     : "";
   const githubText = remote.repositories.length || remote.code.length
     ? "GitHub research matches:\n" +
@@ -4914,7 +5381,7 @@ async function writeResearchGate(projectId, research, prompt) {
 
 const knowledgeInstructions = [
   "Knowledge briefing: the context below combines the permanent Global Learning library, indexed local references and public GitHub research. Review it before running commands or changing files. It records what this app has already built, which tools and prompts worked, existing assets and the user's conventions.",
-  "If the request is about code, Unity, 3D models, materials, shaders, textures, writing or a public repository, inspect the relevant local reference paths and verify public repositories with the GitHub tools actually exposed in this session (coding_github_* in Coding mode, github_github_* in Research). If reference tools are exposed in this session (coding_reference_search, coding_reference_sources, coding_reference_read), use them to search the user's indexed folders and links. Never guess a tool name, never claim GitHub is unavailable, and verify before copying.",
+  "If the request is about code, Unity, 3D models, materials, shaders, textures, writing or a public repository, search the local reference folders (coding_reference_search_local), the saved URL index (coding_reference_search_urls) and the GitHub knowledge index (coding_reference_search_github) before inventing an implementation. Verify live public repositories with coding_github_search_repositories, coding_github_repo_tree and coding_github_read_file. Use coding_github_index_repo to add a useful repository to Global Learning. Never guess a tool name, never claim GitHub is unavailable, and verify before copying.",
 ].join("\n");
 
 async function referenceContextFor(query) {
@@ -5062,10 +5529,19 @@ app.get("/api/references/status", async (req, res) => {
     const settings = await getSettings();
     const index = await loadReferenceIndex();
     const signature = referenceSourceSignature(settings);
+    const githubIndex = await loadGithubIndex().catch(() => ({ repos: {}, files: {} }));
     res.json({
       ok: true,
       updatedAt: index.updatedAt || null,
       count: index.entries?.length || 0,
+      counts: (index.entries || []).reduce((out, entry) => {
+        out[entry.type] = (out[entry.type] || 0) + 1;
+        return out;
+      }, {}),
+      github: {
+        repos: Object.keys(githubIndex.repos || {}).length,
+        files: Object.keys(githubIndex.files || {}).length,
+      },
       stale: !referenceIndexIsFresh(index, signature),
       busy: Boolean(referenceIndexJob),
       signature,
@@ -5075,6 +5551,19 @@ app.get("/api/references/status", async (req, res) => {
       },
       ttlMs: REFERENCE_INDEX_TTL,
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/references/index-source", async (req, res) => {
+  try {
+    const kind = String(req.body?.kind || "").toLowerCase();
+    const id = String(req.body?.id || "");
+    if (!["folder", "link"].includes(kind)) return res.status(400).json({ error: "kind must be folder or link" });
+    if (!id) return res.status(400).json({ error: "id is required" });
+    const result = await refreshReferenceSource(kind, id);
+    res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -5136,11 +5625,32 @@ app.get("/api/references/search", async (req, res) => {
     // Search returns immediately with the current index and refreshes it in the
     // background when sources changed; a live web crawl must never block a tool.
     if (stale) scheduleReferenceIndex(500);
-    const matches = searchReferenceEntries(index, query, limit).map((entry) => ({
+    const scope = String(req.query.scope || "all").toLowerCase();
+    const types =
+      scope === "local"
+        ? ["folder", "file", "upload"]
+        : scope === "url"
+          ? ["url"]
+          : scope === "github"
+            ? ["github-repo", "github-file"]
+            : null;
+    const scoped = types
+      ? { ...index, entries: (index.entries || []).filter((entry) => types.includes(entry.type)) }
+      : index;
+    const matches = searchReferenceEntries(scoped, query, limit).map((entry) => ({
       ...entry,
       text: String(entry.text || "").slice(0, 2000),
     }));
-    res.json({ ok: true, query, updatedAt: index.updatedAt, count: index.entries.length, stale, matches });
+    res.json({
+      ok: true,
+      query,
+      scope,
+      updatedAt: index.updatedAt,
+      count: scoped.entries.length,
+      total: index.entries.length,
+      stale,
+      matches,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -5778,6 +6288,10 @@ app.get("/api/github/repos/:owner/:repo/tree", async (req, res) => {
           sha: entry.sha,
           html_url: `https://github.com/${owner}/${repo}/${entry.type === "tree" ? "tree" : "blob"}/${encodeURIComponent(treeRef)}/${entry.path.split("/").map(encodeURIComponent).join("/")}`,
         }));
+      const files = entries
+        .filter((entry) => entry.type === "file")
+        .map((entry) => ({ path: entry.path, size: entry.size || 0 }));
+      void rememberGithubRepo(owner, repo, { tree: files, source: "tool" });
       return res.json({ ok: true, entries, ref: treeRef, path: "" });
     }
     const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
@@ -5809,6 +6323,7 @@ app.get("/api/github/repos/:owner/:repo/file", async (req, res) => {
     }
     const buffer = Buffer.from(String(data.content || ""), data.encoding === "base64" ? "base64" : "utf8");
     const isBinary = buffer.includes(0);
+    if (!isBinary) void rememberGithubFile(owner, repo, data.path, buffer.toString("utf8"), data.html_url);
     res.json({
       ok: true,
       path: data.path,
@@ -5842,6 +6357,7 @@ app.get("/api/github/repos/:owner/:repo/download", async (req, res) => {
         error: `File is ${(buffer.length / 1024 / 1024).toFixed(1)} MB. Downloads are capped at 25 MB for workspace safety.`,
       });
     }
+    if (!buffer.includes(0)) void rememberGithubFile(owner, repo, data.path, buffer.toString("utf8"));
     res.json({
       ok: true,
       path: data.path,
@@ -5884,6 +6400,55 @@ app.get("/api/github/repos/:owner/:repo/zip", async (req, res) => {
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", `attachment; filename="${owner}-${repo}.zip"`);
     res.send(buffer);
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.get("/api/github/index", async (req, res) => {
+  try {
+    const data = await loadGithubIndex();
+    const repos = Object.values(data.repos || {});
+    res.json({
+      ok: true,
+      updatedAt: data.updatedAt || null,
+      repos: repos.map((repo) => ({
+        fullName: repo.fullName,
+        url: repo.url,
+        description: repo.description || "",
+        stars: repo.stars || 0,
+        language: repo.language || "",
+        files: (repo.tree || []).length,
+        assets: repo.assets || { images: [], models: [], audio: [] },
+        indexedAt: repo.indexedAt,
+      })),
+      files: Object.keys(data.files || {}).length,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/github/index", async (req, res) => {
+  try {
+    const owner = String(req.body?.owner || "").trim();
+    const repo = String(req.body?.repo || "").trim();
+    if (!owner || !repo) return res.status(400).json({ error: "owner and repo are required" });
+    const record = await rememberGithubRepo(owner, repo, {
+      force: Boolean(req.body?.force),
+      source: "manual",
+    });
+    if (!record) return res.status(502).json({ error: "GitHub repository could not be indexed" });
+    res.json({
+      ok: true,
+      repo: {
+        fullName: record.fullName,
+        url: record.url,
+        files: (record.tree || []).length,
+        assets: record.assets || { images: [], models: [], audio: [] },
+        indexedAt: record.indexedAt,
+      },
+    });
   } catch (error) {
     res.status(502).json({ error: error.message });
   }

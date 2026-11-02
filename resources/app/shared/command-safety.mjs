@@ -36,7 +36,40 @@ const SAFE_DELETE_NAMES = new Set([
   "target",
   "obj",
   "bin",
+  "release",
+  "dist-electron",
+  "out-tsc",
+  "logs",
+  "htmlcov",
+  ".nyc_output",
+  ".angular",
+  ".svelte-kit",
+  ".astro",
+  ".output",
+  ".vercel",
+  ".netlify",
+  ".expo",
+  ".gradle",
+  ".dart_tool",
+  ".serverless",
+  ".terraform",
+  ".venv",
+  "venv",
+  "vendor",
+  "storybook-static",
+  "testresults",
 ]);
+
+// Read-only inspection commands: listing, reading, searching, Git history and
+// version checks. These never modify the machine, so they skip the destructive
+// rules entirely. Anything that could write, delete or execute is excluded.
+const READ_ONLY_COMMAND =
+  /^\s*(?:(?:powershell|pwsh)(?:\.exe)?\b[^\n]*?-command\s+["']?)?\s*(?:get-[a-z]+|test-path|resolve-path|select-string|select-object|where-object|foreach-object|sort-object|group-object|measure-object|compare-object|format-table|format-list|format-wide|out-string|out-host|write-output|write-host|dir|ls|gci|gc|cat|type|findstr|find|where|which|echo|pwd|cd|chdir|set-location|pushd|popd|git\s+(?:status|log|diff|show|branch|remote|rev-parse|ls-files|blame)|npm\s+(?:ls|list|view|outdated|--version)|node\s+--version|python\s+--version|dotnet\s+--version|tsc\s+--version|head|tail|more|wc|stat|file|du|df|grep|rg|tree|hostname|whoami|systeminfo|start-sleep)\b/i;
+
+// Any sign that the command writes, deletes, installs or executes something
+// new. When one is present the read-only shortcut is skipped.
+const WRITE_OR_EXEC_INTENT =
+  /(?:^|\s)-(?:delete|exec|execdir|ok|okdir)\b|\b(?:shred|truncate)\b|(?:^|[^<>])>{1,2}(?!\s*&)|(?:^|[|;&(]\s*|\b(?:then|do)\s+)(?:set-content|add-content|out-file|new-item|remove-item|del|erase|rmdir|rd|rm|move-item|copy-item|rename-item|set-item|clear-content|tee-object|start-process|start-job|invoke-expression|iex|invoke-command|stop-process|taskkill|kill|pkill|curl|wget|iwr|irm|set-executionpolicy|reg\s+add|reg\s+delete|schtasks|sc\s+create|sc\s+delete|npm\s+(?:install|i|ci|uninstall)|yarn\s+(?:add|install)|pnpm\s+(?:add|install)|git\s+(?:push|commit|reset|clean|checkout|restore|merge|rebase|apply)|node\s+-e|python\s+-c|pip\s+install|dotnet\s+(?:build|run|test|publish)|cargo\s+(?:build|run)|go\s+(?:build|run)|make|cmake|mkdir|md|touch|chmod|chown)\b/i;
 
 const RULES = [
   {
@@ -52,7 +85,7 @@ const RULES = [
     id: "encoded-powershell",
     category: "Remote code execution",
     severity: "high",
-    pattern: /\b(?:powershell|pwsh)\b[^\n]*(?:-enc|-encodedcommand|-e\s+[a-z0-9+/=]{40,})/i,
+    pattern: /\b(?:powershell|pwsh)\b[^\n]*(?:-(?:enc|encodedcommand)\b|-e\s+[a-z0-9+/=]{40,})/i,
     reason:
       "Encoded PowerShell hides its real contents. This is a common way to run malware or bypass inspection.",
     summary: "Runs obfuscated PowerShell that cannot be reviewed.",
@@ -348,7 +381,27 @@ function extractDeleteTargets(flat) {
 function targetZone(target, cwd) {
   let value = String(target || "").trim().replace(/^["'`]+|["'`,;)]+$/g, "");
   if (!value) return "unknown";
-  const norm = value.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "") || "/";
+  let norm = value.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "") || "/";
+  const normalizedCwd = cwd
+    ? path.resolve(String(cwd)).replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "")
+    : "";
+  let resolved = norm;
+  const profileShorthand = /^(?:~|\$home|%userprofile%|%homedrive%%homepath%)/i.test(value);
+  if (normalizedCwd && !profileShorthand && !path.isAbsolute(value) && norm !== "/" && !/^[a-z]:/i.test(norm)) {
+    try {
+      resolved = path.resolve(String(cwd), value).replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
+    } catch {
+      resolved = norm;
+    }
+  }
+  if (normalizedCwd && (resolved === normalizedCwd || norm === "." || norm === "./")) {
+    return "project";
+  }
+  if (normalizedCwd && resolved.startsWith(normalizedCwd + "/")) {
+    if (/(^|\/)\.git(\/|$)/.test(resolved)) return "git";
+    const inner = resolved.replace(/[*?]+$/g, "").split("/").filter(Boolean).pop() || "";
+    return SAFE_DELETE_NAMES.has(inner) ? "build" : "workspace";
+  }
   if (
     norm === "/" ||
     norm === "/*" ||
@@ -387,18 +440,10 @@ function targetZone(target, cwd) {
   const base = norm.replace(/[*?]+$/g, "").split("/").filter(Boolean).pop() || "";
   if (SAFE_DELETE_NAMES.has(base)) return "build";
   if (norm === "." || norm === ".." || norm === "./" || norm === "../" || norm === ".\\") return "project";
-  if (cwd) {
-    const normalizedCwd = path.resolve(String(cwd)).replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
-    if (normalizedCwd && (norm === normalizedCwd || norm === normalizedCwd + "/*")) return "project";
-    if (normalizedCwd && norm.startsWith(normalizedCwd + "/")) {
-      const base2 = norm.split("/").filter(Boolean).pop() || "";
-      return SAFE_DELETE_NAMES.has(base2) ? "build" : "unknown";
-    }
-  }
   return "unknown";
 }
 
-function deletionAssessment(flat) {
+function deletionAssessment(flat, cwd = "") {
   const targets = extractDeleteTargets(flat);
   const recursive =
     /\brm\b[^\n;&|]*\s(?:-[a-z]*r[a-z]*|--recursive)/i.test(flat) ||
@@ -415,7 +460,7 @@ function deletionAssessment(flat) {
   if (!recursive && !wildcard) {
     return { destructive: false, recursive, wildcard, targets, severity: "safe", reasons: [] };
   }
-  const zones = targets.map((target) => targetZone(target, ""));
+  const zones = targets.map((target) => targetZone(target, cwd));
   const reasons = [];
   let severity = "medium";
   if (zones.includes("root")) {
@@ -441,6 +486,10 @@ function deletionAssessment(flat) {
   if (zones.includes("project")) {
     if (severity === "medium") severity = "high";
     reasons.push("The delete targets the project folder you are working in.");
+  }
+  if (zones.includes("workspace") && severity === "medium") {
+    severity = "high";
+    reasons.push("This recursive delete targets a folder inside your active project that is not a known build or cache folder.");
   }
   if (wildcard && severity === "medium") {
     severity = "high";
@@ -497,6 +546,12 @@ export function assessCommand(command, options = {}) {
   };
   if (!flat) return result;
 
+  // A pure inspection command cannot be destructive. Return immediately so a
+  // read-only Get-Content / Get-ChildItem never waits for an approval popup.
+  if (READ_ONLY_COMMAND.test(flat) && !WRITE_OR_EXEC_INTENT.test(flat)) {
+    return result;
+  }
+
   for (const rule of RULES) {
     if (!rule.pattern.test(flat)) continue;
     result.dangerous = true;
@@ -507,7 +562,7 @@ export function assessCommand(command, options = {}) {
     if (result.summary === GENERIC_SUMMARIES.safe) result.summary = rule.summary;
   }
 
-  const deletion = deletionAssessment(flat);
+  const deletion = deletionAssessment(flat, options.cwd || "");
   if (deletion.destructive) {
     result.dangerous = true;
     result.targets = deletion.targets;

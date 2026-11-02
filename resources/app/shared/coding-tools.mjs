@@ -394,10 +394,73 @@ export const codingTools = [
       properties: {
         query: { type: "string", description: "Keywords, API name, file name or topic to look up." },
         limit: { type: "number", description: "Maximum matches (1-30, default 8)." },
+        scope: { type: "string", description: "all, local, url or github. Default: all." },
       },
       required: ["query"],
       additionalProperties: false,
     },
+  },
+  {
+    name: "reference_search_local",
+    description:
+      "Search only the indexed local reference folders and files: textures, models, audio, scripts, documents and asset libraries the user already has on disk. Use this before assuming there is no local documentation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number", description: "Maximum matches (1-30, default 8)." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "reference_search_urls",
+    description:
+      "Search only the indexed saved URLs and documentation pages. Use this for API docs, engine manuals and web references the user saved, without crawling the web again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number", description: "Maximum matches (1-30, default 8)." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "reference_search_github",
+    description:
+      "Search the GitHub knowledge index: repositories, README text, file trees, asset paths and source files previously indexed into Global Learning. This does not call GitHub.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number", description: "Maximum matches (1-30, default 8)." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "reference_index_source",
+    description:
+      "Re-index one saved local folder or saved URL immediately. Call reference_sources first to get the source id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", description: "folder or link." },
+        id: { type: "string", description: "Source id from reference_sources." },
+      },
+      required: ["kind", "id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "reference_status",
+    description:
+      "Report index freshness, entry counts by category (local files, URLs, GitHub knowledge) and how many folders and links are saved.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "reference_sources",
@@ -431,6 +494,21 @@ export const codingTools = [
     inputSchema: {
       type: "object",
       properties: { limit: { type: "number", description: "Maximum repositories to return (1-100)." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "github_index_repo",
+    description:
+      "Index a public GitHub repository into Global Learning: README, file tree, asset paths (images, models, audio) and every file read afterwards. Future prompts can search it with reference_search_github without another GitHub call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        force: { type: "boolean", description: "Re-index even when a recent copy exists." },
+      },
+      required: ["owner", "repo"],
       additionalProperties: false,
     },
   },
