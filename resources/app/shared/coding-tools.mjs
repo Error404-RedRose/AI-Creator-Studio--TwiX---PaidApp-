@@ -314,6 +314,93 @@ export const codingTools = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "creator_studio_guide",
+    description:
+      "Read the Creator Studio 3D + Photo framework: the live scene tools, professional modelling rules (lofted humanoid, surface props, no primitive-mashed characters) and how to export models into this coding workspace. Call this before creating any 3D asset for the user.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "creator_scene_list",
+    description:
+      "List the Creator Studio 3D workspaces currently open in the app. Returns project ids you can pass to creator_scene_tool.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "creator_scene_tool",
+    description:
+      "Run a Creator Studio 3D scene tool against an open 3D project. Examples: humanoid_create, mesh_create, prop_create, building_create, foliage_create, material_create, material_assign, mesh_generate_uv, scene_validate, export_scene. Pass args exactly as the 3D tool expects. Use this to model real assets for the coding or Unity project, then call creator_3d_export to copy the file into this workspace.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", description: "3D project id. Omit to use the first open 3D scene." },
+        tool: { type: "string", description: "Scene tool name, with or without the twix_ prefix." },
+        args: { type: "object", description: "Arguments for the scene tool." },
+      },
+      required: ["tool"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "creator_3d_export",
+    description:
+      "Export the live 3D scene or selection and copy the exported GLB/FBX/OBJ into this coding workspace (default Assets/Models). Use format glb for rigged or textured assets. Returns the workspace path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", description: "3D project id. Omit to use the first open 3D scene." },
+        format: { type: "string", enum: ["glb", "fbx", "obj", "stl"] },
+        scope: { type: "string", enum: ["scene", "selection"] },
+        fileName: { type: "string" },
+        destination: { type: "string", description: "Workspace folder or file path (default Assets/Models)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "creator_library_list",
+    description:
+      "Search the user's 3D Reference Library: the folder they linked in the 3D applet. Returns models, textures and animation clips with absolute paths and rig metadata (bone count, clip count, blendshape count, mesh count). Use it before modelling or rigging a character, animal, prop or game asset so you reuse the user's real assets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["models", "textures", "animations", "all"], description: "Asset type to list (default models)." },
+        query: { type: "string", description: "Optional name or folder search." },
+        limit: { type: "number", description: "Maximum results (1-120, default 40)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "creator_library_copy",
+    description:
+      "Copy one model, texture or animation from the user's 3D Reference Library into this coding workspace so the Unity project or a 3D game can use it. Source files are never modified. Defaults to Assets/Models for models and Assets/Textures for images.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute library path returned by creator_library_list, or a path relative to the library folder." },
+        destination: { type: "string", description: "Workspace file or folder (default Assets/Models or Assets/Textures)." },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "creator_photo_generate",
+    description:
+      "Generate a photo, icon, sprite or texture with the Creator Studio Photo framework and save the PNG into this coding workspace (default Assets/Textures). Uses the image provider configured in Creator Studio Settings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        size: { type: "string", description: "1024x1024, 1536x1024 or 1024x1536." },
+        provider: { type: "string", enum: ["openai", "gemini"] },
+        destination: { type: "string", description: "Workspace file path or folder (default Assets/Textures)." },
+      },
+      required: ["prompt"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "get_root",
     description: "Return the trusted coding workspace root path and whether writes/commands are enabled.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -640,7 +727,7 @@ export const codingTools = [
   {
     name: "github_push_files",
     description:
-      "Create or update one or more text files in a GitHub repository. This commits (pushes) the files. Only use when the user explicitly asks to push or publish.",
+      "Create or update one or more files in a GitHub repository. This commits (pushes) the files. Large files are uploaded through Git LFS automatically, so assets are no longer blocked by the old 25 MB limit. Only use when the user explicitly asks to push or publish.",
     inputSchema: {
       type: "object",
       properties: {

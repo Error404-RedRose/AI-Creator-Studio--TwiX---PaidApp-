@@ -83,7 +83,7 @@ export const tools = [
     category: "modeling",
     mutating: true,
     description:
-      "Create a mesh primitive in the scene. Dimensions are in meters. Use multipart names (e.g. 'Lid', 'Handle Left') for props.",
+      "Create a blockout primitive (box, sphere, cylinder, cone, torus, plane). Use primitives only for rough blockouts, scale references or hard-surface mechanical parts. For characters use humanoid_create; for curved/organic props use mesh_create or prop_create. Never build a humanoid from primitives.",
     inputSchema: {
       type: "object",
       properties: {
@@ -99,6 +99,142 @@ export const tools = [
         parentId: { type: "string" },
       },
       required: ["name", "primitive"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ai_model_generate",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Generate a high-quality textured GLB with Meshy or Tripo (the same class of AI 3D service as Meshy/Tripo), then import it into the live scene. Use this for characters, creatures, props, weapons, furniture, vehicles, buildings and any organic detail that procedural surfaces cannot reach. Requires a Meshy or Tripo API key in Settings > Providers. Generation takes about 1-4 minutes. Prefer this when the user asks for a polished, realistic, game-ready model.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "Detailed description of the model, including style, materials and silhouette." },
+        provider: { type: "string", enum: ["meshy", "tripo"], description: "Omit to use whichever key is configured (Meshy first)." },
+        name: { type: "string", description: "Scene object name." },
+        height: { type: "number", description: "Optional target height in metres; the imported model is scaled uniformly to match." },
+        scale: { type: "number", description: "Extra import scale (default 1)." },
+        texture: { type: "boolean", description: "Request textures/PBR (default true)." },
+        model: { type: "string", description: "Provider model id, e.g. meshy-6 or v3.1-20260211." },
+        polycount: { type: "number", description: "Target triangle budget for providers that support it (default 30000)." },
+      },
+      required: ["prompt"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "humanoid_create",
+    category: "humanoid",
+    mutating: true,
+    description:
+      "Create a complete humanoid as ONE smooth, UV-mapped, lofted mesh with a real skeleton and skin weights. The body and face (eyes, brows, lips) share one skinned mesh with material slots; hair is an optional second skinned mesh. Includes continuous torso, neck and shaped head, deltoids, chest and glutes, arms, hands, individual fingers, legs, feet and toes. Use feminine 0..1, build 0.7..1.4, muscle 0..1 and age 0..1 for proportions, pose a/relaxed/t, and hairStyle short/long/bun/ponytail. Always prefer this for humans; add clothing with garment_create afterwards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        height: { type: "number", description: "Total height in meters (default 1.78)." },
+        build: { type: "number", description: "0.7 slim, 1 average, 1.4 heavy." },
+        feminine: { type: "number", description: "0 masculine, 1 feminine." },
+        muscle: { type: "number", description: "0..1 muscle definition." },
+        age: { type: "number", description: "0..1; widens the waist and softens the jaw." },
+        fingers: { type: "boolean", description: "Include individual fingers (default true)." },
+        toes: { type: "boolean", description: "Include individual toes (default true)." },
+        chest: { type: "boolean", description: "Add a subtle chest form." },
+        skinColor: color,
+        rig: { type: "boolean", description: "Build skeleton and skin weights (default true)." },
+        hairStyle: { type: "string", enum: ["none", "short", "long", "bun", "ponytail"], description: "Optional separate hair mesh bound to the head bone." },
+        hairColor: color,
+        eyeColor: color,
+        faceDetail: { type: "boolean", description: "Add eyes, eyebrows and lips as a skinned face mesh (default true)." },
+        pose: { type: "string", enum: ["a", "relaxed", "t"], description: "a = A-pose (default), relaxed = arms down, t = T-pose." },
+        segments: { type: "number", description: "Radial segments per ring (10-64, default 32)." },
+        position: vec3,
+        rotation: vec3,
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "prop_create",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Create a finished smooth surface prop from a preset: vase, bottle, lamp, barrel, bowl, crate, pillar, table, chair, sword, axe, shield, rock. Output is one vertex-based mesh with UVs and smooth normals, not a pile of primitives.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          enum: ["vase", "bottle", "lamp", "barrel", "bowl", "crate", "pillar", "table", "chair", "sword", "axe", "shield", "rock"],
+        },
+        name: { type: "string" },
+        width: { type: "number" },
+        height: { type: "number" },
+        depth: { type: "number" },
+        segments: { type: "number" },
+        color: color,
+        roughness: { type: "number" },
+        metallic: { type: "number" },
+        position: vec3,
+        rotation: vec3,
+      },
+      required: ["kind"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mesh_create",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Build a real surface mesh from cross-sections. mode=loft takes sections [{y, rx, rz, x, z, shape}] where shape 0 is round and 1 is a rounded square. mode=revolve takes a profile [{y, r}]. mode=tube sweeps a radius along points [{x,y,z}]. Use this for organic, curved, sculpted and lathed forms instead of stacking primitives. UVs and smooth normals are generated.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        mode: { type: "string", enum: ["loft", "revolve", "tube"] },
+        sections: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              y: { type: "number" },
+              rx: { type: "number" },
+              rz: { type: "number" },
+              x: { type: "number" },
+              z: { type: "number" },
+              shape: { type: "number" },
+            },
+            required: ["y", "rx"],
+          },
+        },
+        profile: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { y: { type: "number" }, r: { type: "number" } },
+            required: ["y", "r"],
+          },
+        },
+        points: {
+          type: "array",
+          items: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } } },
+        },
+        radius: { type: "number" },
+        radial: { type: "number" },
+        tubular: { type: "number" },
+        flat: { type: "number", description: "Squash the tube on one axis (1 = round)." },
+        segments: { type: "number", description: "Radial segments (6-96)." },
+        color: color,
+        roughness: { type: "number" },
+        metallic: { type: "number" },
+        position: vec3,
+        rotation: vec3,
+      },
+      required: ["name", "mode"],
       additionalProperties: false,
     },
   },
@@ -207,6 +343,24 @@ export const tools = [
     },
   },
   {
+    name: "mesh_cleanup",
+    category: "modeling",
+    mutating: true,
+    description:
+      "Professional cleanup for imported or CAD meshes: weld coincident vertices at a tolerance, remove degenerate triangles, recompute normals and rebuild box UVs with 1 metre texture tiles. Use before finishing or exporting a CAD/building import.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        objectId: objectId,
+        tolerance: { type: "number", description: "Weld distance in metres (default 0.0001)." },
+        uv: { type: "boolean", description: "Rebuild 1 m tiled box UVs (default true)." },
+        tileSize: { type: "number", description: "Metres per texture tile (default 1)." },
+      },
+      required: ["objectId"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "mesh_set_smooth",
     category: "modeling",
     mutating: true,
@@ -292,6 +446,7 @@ export const tools = [
         objectId: objectId,
         projection: { type: "string", enum: ["box", "planar", "spherical"] },
         scale: { type: "number" },
+        tileSize: { type: "number", description: "Physical metres per texture tile (1 = one tile per metre). Use this on buildings and CAD imports so texture density stays constant across objects." },
       },
       required: ["objectId", "projection"],
       additionalProperties: false,
@@ -494,7 +649,7 @@ export const tools = [
     category: "humanoid",
     mutating: true,
     description:
-      "Create a garment mesh fitted around a body object. Garments are separate named meshes and are skinned to the body armature.",
+      "Create a fitted garment from the body's own surface (shirt, jacket, pants, skirt, collar, boots or hat). The shell copies the body skin weights and binds to the same skeleton, so it deforms with the character instead of floating around it. Use this before trying to model clothing from primitives.",
     inputSchema: {
       type: "object",
       properties: {
@@ -768,7 +923,7 @@ export const destructiveTools = new Set([
 
 export function toolsForWorkspace(workspace) {
   const byWorkspace = {
-    prop: ["modeling", "texture", "scene", "inspect", "view", "project"],
+    prop: ["modeling", "humanoid", "texture", "scene", "inspect", "view", "project"],
     building: ["building", "modeling", "texture", "scene", "inspect", "view", "project"],
     humanoid: ["humanoid", "modeling", "texture", "scene", "inspect", "view", "project"],
     texture: ["texture", "inspect", "view", "project", "scene"],

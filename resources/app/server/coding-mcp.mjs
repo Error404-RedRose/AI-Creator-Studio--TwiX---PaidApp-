@@ -14,6 +14,7 @@ const APP_ROOT = process.env.TWIX_APP_ROOT ? path.resolve(process.env.TWIX_APP_R
 const TRUSTED = process.env.TWIX_CODING_TRUSTED === "1";
 const UNITY_PORT = process.env.TWIX_UNITY_BRIDGE_PORT ? Number(process.env.TWIX_UNITY_BRIDGE_PORT) : null;
 const BRIDGE_URL = process.env.TWIX_BRIDGE_URL || "";
+const BRIDGE_TOKEN = process.env.TWIX_BRIDGE_TOKEN || "";
 const IGNORED = new Set(["node_modules", ".git", ".svn", "dist", "build", ".next", ".turbo", "release", ".twix"]);
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_ZIP_BYTES = 200 * 1024 * 1024;
@@ -24,6 +25,24 @@ const GITHUB_ONLY = process.env.TWIX_GITHUB_ONLY === "1";
 const RESEARCH_GATE_FILE = process.env.TWIX_RESEARCH_GATE_FILE || "";
 const CODING_PROJECT_ID = process.env.TWIX_CODING_PROJECT_ID || "";
 const RESEARCH_GATE_TTL = 60 * 60 * 1000;
+
+const CREATOR_STUDIO_GUIDE = [
+  "## Creator Studio 3D framework",
+  "Creator Studio is a live Three.js modelling workspace. The coding and Unity assistants can drive it through creator_scene_tool.",
+  "",
+  "Professional modelling rules:",
+  "- For Tripo/Meshy-class results use ai_model_generate (it calls the configured Meshy or Tripo key and imports a textured GLB). Use humanoid_create for offline procedural characters. Characters must be ONE continuous, UV-mapped, lofted mesh with a real skeleton. Use humanoid_create (height, build, feminine, muscle, age, pose, hairStyle, skinColor, faceDetail, rig). Body and face share one skinned mesh; hair is a separate skinned mesh. Never stack cubes/capsules for a human.",
+  "- Curved, organic and manufactured props use prop_create presets (vase, bottle, lamp, barrel, bowl, crate, pillar, table, chair, sword, axe, shield, rock) or mesh_create (loft sections, revolve profile, tube sweep).",
+  "- object_create primitives are blockout-only. Join blockouts with object_join before calling an asset finished.",
+  "- Finish with mesh_set_smooth, mesh_generate_uv, materials (material_create/material_assign), scene_validate and export_scene.",
+  "- After export, creator_3d_export copies the GLB/FBX into this workspace (default Assets/Models). Prefer GLB for rigged or textured assets.",
+  "- creator_library_list searches the user's 3D Reference Library (models, rigs, clips, textures with bone/clip/blendshape counts). creator_library_copy copies a chosen library asset into this workspace so it can be used directly. Check the library before building a new character, prop or rig.",
+  "",
+  "Photo framework: creator_photo_generate uses the Creator Studio image provider and writes the PNG into this workspace. Use it for photos, icons, sprites and textures. For layered editing, point the user to the Photo applet.",
+  "",
+  "Typical flow: creator_scene_list -> creator_scene_tool(tool='scene_inspect') -> creator_scene_tool(tool='ai_model_generate' for a Tripo/Meshy-class asset, or humanoid_create/mesh_create/prop_create offline) -> material/UV tools -> creator_3d_export(format='glb') -> reference the exported file in the project.",
+].join("\n");
+
 
 function researchGateStatus() {
   if (!RESEARCH_GATE_FILE) return { required: false, ok: true, reason: "" };
@@ -245,6 +264,158 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const payload = await response.json().catch(() => ({ ok: response.ok }));
       return respond(payload, !response.ok || payload.ok === false);
+    }
+    if (name === "creator_studio_guide") {
+      return respond({ ok: true, guide: CREATOR_STUDIO_GUIDE });
+    }
+    if (name === "creator_photo_generate") {
+      if (!BRIDGE_URL) return respond({ ok: false, error: "Creator Studio bridge is not configured for this workspace." }, true);
+      if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode to save generated images." }, true);
+      const prompt = String(args.prompt || "").trim();
+      if (!prompt) return respond({ ok: false, error: "prompt is required" }, true);
+      const response = await fetch(BRIDGE_URL + "/api/providers/image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: args.provider === "gemini" ? "gemini" : "openai",
+          prompt,
+          size: args.size || "1024x1024",
+        }),
+        signal: AbortSignal.timeout(190000),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.dataUrl) {
+        return respond({ ok: false, error: payload.error || "Image generation failed (HTTP " + response.status + ")" }, true);
+      }
+      let bytes;
+      if (String(payload.dataUrl).startsWith("data:")) {
+        const base64 = String(payload.dataUrl).split(",")[1] || "";
+        bytes = Buffer.from(base64, "base64");
+      } else {
+        const remote = await fetch(String(payload.dataUrl), { signal: AbortSignal.timeout(60000) });
+        if (!remote.ok) return respond({ ok: false, error: "Could not download the generated image" }, true);
+        bytes = Buffer.from(await remote.arrayBuffer());
+      }
+      let destination = args.destination ? String(args.destination) : "Assets/Textures";
+      if (!path.extname(destination)) destination = path.join(destination, "CreatorStudio-" + Date.now() + ".png");
+      const target = path.isAbsolute(destination) ? destination : path.resolve(ROOT, destination);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, bytes);
+      return respond({ ok: true, path: relPath(target), bytes: bytes.length, provider: payload.provider || null, model: payload.model || null });
+    }
+    if (name.startsWith("creator_")) {
+      if (!BRIDGE_URL) return respond({ ok: false, error: "Creator Studio bridge is not configured for this workspace." }, true);
+      const listScenes = async () => {
+        const response = await fetch(BRIDGE_URL + "/api/bridge/scenes", { signal: AbortSignal.timeout(8000) });
+        const payload = await response.json().catch(() => ({}));
+        return Array.isArray(payload.scenes) ? payload.scenes : [];
+      };
+      if (name === "creator_library_list") {
+        if (!BRIDGE_URL) return respond({ ok: false, error: "Creator Studio bridge is not configured for this workspace." }, true);
+        const params = new URLSearchParams({
+          kind: args.kind ? String(args.kind) : "models",
+          query: args.query ? String(args.query) : "",
+          limit: String(Math.max(1, Math.min(120, Number(args.limit) || 40))),
+        });
+        const response = await fetch(BRIDGE_URL + "/api/bridge/library?" + params.toString(), { signal: AbortSignal.timeout(20000) });
+        const payload = await response.json().catch(() => ({ ok: false, error: "Library returned invalid JSON (HTTP " + response.status + ")" }));
+        return respond(payload, !response.ok || payload.ok === false);
+      }
+      if (name === "creator_library_copy") {
+        if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode to copy library assets." }, true);
+        if (!BRIDGE_URL) return respond({ ok: false, error: "Creator Studio bridge is not configured for this workspace." }, true);
+        const libraryResponse = await fetch(BRIDGE_URL + "/api/bridge/library?kind=models&limit=1", { signal: AbortSignal.timeout(20000) });
+        const library = await libraryResponse.json().catch(() => ({}));
+        const folder = library && library.folder ? String(library.folder) : "";
+        if (!folder) return respond({ ok: false, error: "No 3D library folder is linked. Ask the user to link one in the 3D applet." }, true);
+        const raw = String(args.path || "");
+        if (!raw) return respond({ ok: false, error: "path is required" }, true);
+        const root = path.resolve(folder);
+        const source = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(root, raw);
+        const relative = path.relative(root, source);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+          return respond({ ok: false, error: "That path is outside the 3D library folder." }, true);
+        }
+        const stat = await fs.stat(source).catch(() => null);
+        if (!stat || !stat.isFile()) return respond({ ok: false, error: "Library file not found" }, true);
+        const ext = path.extname(source).slice(1).toLowerCase();
+        const image = ["png", "jpg", "jpeg", "webp", "bmp", "tga", "gif", "hdr", "exr", "ktx2", "svg"].includes(ext);
+        let destination = args.destination ? String(args.destination) : image ? "Assets/Textures" : "Assets/Models";
+        if (!path.extname(destination)) destination = path.join(destination, path.basename(source));
+        const target = path.isAbsolute(destination) ? destination : path.resolve(ROOT, destination);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.copyFile(source, target);
+        return respond({
+          ok: true,
+          path: relPath(target),
+          source: source.replace(/\\/g, "/"),
+          bytes: stat.size,
+          kind: image ? "texture" : ext === "anim" || ext === "bvh" ? "animation" : "model",
+        });
+      }
+      if (name === "creator_scene_list") {
+        const scenes = await listScenes();
+        return respond({ ok: true, scenes });
+      }
+      if (name === "creator_scene_tool" || name === "creator_3d_export") {
+        let projectId = args.projectId ? String(args.projectId) : "";
+        if (!projectId) {
+          const scenes = await listScenes();
+          projectId = scenes[0] && scenes[0].projectId ? String(scenes[0].projectId) : "";
+        }
+        if (!projectId) {
+          return respond({ ok: false, error: "No Creator Studio 3D workspace is open. Ask the user to open the 3D applet on a project, then retry." }, true);
+        }
+        const callScene = async (toolName, toolArgs) => {
+          const response = await fetch(BRIDGE_URL + "/api/bridge/tool", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token: BRIDGE_TOKEN,
+              projectId,
+              name: toolName,
+              args: toolArgs || {},
+            }),
+            signal: AbortSignal.timeout(310000),
+          });
+          return response.json().catch(() => ({ ok: false, error: "Bridge returned invalid JSON (HTTP " + response.status + ")" }));
+        };
+        if (name === "creator_scene_tool") {
+          const toolName = String(args.tool || "").replace(/^twix_/, "");
+          if (!toolName) return respond({ ok: false, error: "tool is required" }, true);
+          const result = await callScene(toolName, args.args || {});
+          return respond(result, result && result.ok === false);
+        }
+        if (!TRUSTED) return respond({ ok: false, error: "Writes are disabled. Enable trusted workspace in Coding mode to copy exported models." }, true);
+        const format = ["glb", "fbx", "obj", "stl"].includes(String(args.format)) ? String(args.format) : "glb";
+        const fileName = args.fileName ? String(args.fileName) : "CreatorStudio-" + Date.now() + "." + format;
+        const exported = await callScene("export_scene", {
+          format,
+          scope: args.scope === "selection" ? "selection" : "scene",
+          fileName,
+          includeTextures: true,
+        });
+        if (!exported || exported.ok === false) return respond(exported || { ok: false, error: "Export failed" }, true);
+        const sourcePath = exported && exported.data && exported.data.path ? String(exported.data.path) : "";
+        if (!sourcePath) return respond({ ok: false, error: "The 3D app did not return an export path." }, true);
+        let destination = args.destination ? String(args.destination) : "Assets/Models";
+        if (!path.extname(destination)) destination = path.join(destination, path.basename(sourcePath));
+        const target = path.isAbsolute(destination) ? destination : path.resolve(ROOT, destination);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.copyFile(sourcePath, target);
+        const stat = await fs.stat(target);
+        return respond({
+          ok: true,
+          projectId,
+          path: relPath(target),
+          source: sourcePath,
+          bytes: stat.size,
+          format,
+          warnings: exported.warnings || [],
+          report: exported.data && exported.data.report ? exported.data.report : null,
+        });
+      }
+      return respond({ ok: false, error: "Unknown Creator Studio tool: " + name }, true);
     }
     if (name === "get_root") {
       return respond({ ok: true, root: ROOT, trusted: TRUSTED });

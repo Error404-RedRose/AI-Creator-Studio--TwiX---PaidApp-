@@ -12,6 +12,13 @@ import { fileURLToPath } from "node:url";
 import { createLicenseService } from "./license.mjs";
 import { assessCommand } from "../shared/command-safety.mjs";
 import { createGithubIndex } from "./github-index.mjs";
+import {
+  isLfsPointer,
+  lfsDownloadObject,
+  lfsUploadBuffer,
+  mergeLfsAttributes,
+  parseLfsPointer,
+} from "./github-lfs.mjs";
 
 process.on("uncaughtException", (error) => {
   console.error("[TwiX] uncaughtException", error?.stack || error);
@@ -507,6 +514,8 @@ async function resolveProjectFile(projectId, relPath) {
 
 const defaultSettings = () => ({
   units: "m",
+  studio3d: { folder: "" },
+  hub: { ownerUsername: "TwilightStudio.Dev", ownerAccountId: "" },
   defaultProjectDir: PROJECTS_ROOT,
   autosaveSeconds: 8,
   checkpoints: 40,
@@ -552,6 +561,8 @@ const defaultSettings = () => ({
     openai: { apiKey: "", model: "gpt-4o-mini", imageModel: "gpt-image-1", imageLimit: 100 },
     gemini: { apiKey: "", model: "gemini-1.5-flash", imageModel: "gemini-2.5-flash-image", imageLimit: 100 },
     ollama: { apiKey: "" },
+    meshy: { apiKey: "", model: "meshy-6" },
+    tripo: { apiKey: "", model: "v3.1-20260211" },
   },
   keybindings: {
     objectMesh: "Tab",
@@ -644,6 +655,8 @@ async function getSettings() {
     opencode: { ...defaultSettings().opencode, ...(stored.opencode || {}) },
     mods: { ...defaultSettings().mods, ...(stored.mods || {}) },
     references: { ...defaultSettings().references, ...(stored.references || {}) },
+    studio3d: { ...defaultSettings().studio3d, ...(stored.studio3d || {}) },
+    hub: { ...defaultSettings().hub, ...(stored.hub || {}) },
     github: { ...defaultSettings().github, ...(stored.github || {}) },
     providers: {
       openai: { ...defaultSettings().providers.openai, ...(stored.providers?.openai || {}) },
@@ -681,11 +694,13 @@ const githubSearchCache = new Map();
 const GITHUB_SEARCH_TTL = 5 * 60 * 1000;
 const GITHUB_SEARCH_MAX_CHARS = 256;
 
-// Conservative safety limits. GitHub hard-rejects files over 100 MB and large
-// pushes; staying well below those limits prevents a push from wedging the
-// repository.
-const GITHUB_MAX_FILE_BYTES = 25 * 1024 * 1024;
-const GITHUB_MAX_BATCH_BYTES = 50 * 1024 * 1024;
+// Files above the LFS threshold go through Git LFS instead of being rejected.
+// The blob API stays well under GitHub's 100 MB hard limit; LFS handles the rest.
+const GITHUB_LFS_THRESHOLD_BYTES = 20 * 1024 * 1024;
+const GITHUB_MAX_FILE_BYTES = 95 * 1024 * 1024;
+const GITHUB_MAX_BATCH_BYTES = 2 * 1024 * 1024 * 1024;
+const GITHUB_LFS_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const GITHUB_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const GITHUB_REPO_WARN_BYTES = 1024 * 1024 * 1024;
 const GITHUB_MAX_ZIP_BYTES = 200 * 1024 * 1024;
 
@@ -1198,8 +1213,31 @@ the appropriate \`twix_*\` tool.
    Use the real object ids returned by tools; never invent ids.
 2. **Plan briefly** for multi-step work, then execute. Keep messages short.
 3. **Units are meters.** All dimensions, positions and offsets are in meters, rotations in degrees.
-4. **Build clean multipart assets.** Name parts clearly (Body, Lid, Handle Left, Roof, Jacket ...)
-   and group them under an asset group. Keep hierarchy tidy.
+4. **Model like a professional 3D artist.** A finished asset is a continuous vertex-built surface,
+   not a pile of cubes, spheres and capsules. Use \`twix_humanoid_create\` for every human character
+   (it outputs one smooth lofted body mesh with head, neck, fingers, toes, feet, a skeleton and skin
+   weights). Use \`twix_mesh_create\` for custom loft/revolve/tube surfaces and \`twix_prop_create\`
+   for finished props. Use \`twix_object_create\` primitives only for blockouts, scale references or
+   genuinely hard-surface mechanical parts, and join blockouts into a single mesh before calling the
+   asset finished. Name parts clearly (Body, Lid, Handle Left, Roof, Jacket ...) and keep hierarchy tidy.
+
+## Modelling standard (important)
+
+- **Highest quality:** when a Meshy or Tripo key is configured in Settings > Providers, call
+  \`twix_ai_model_generate\` for characters, creatures, props, vehicles, buildings and detailed organic
+  assets. It generates a textured GLB through Tripo/Meshy-class AI and imports it into the live scene.
+  This is the standard the user expects for finished models. Use the procedural tools for blockouts,
+  edits and offline work, and never claim a primitive build is Tripo/Meshy quality.
+- **Humans and creatures:** never assemble a character from primitives. Prefer
+  \`twix_ai_model_generate\`, or call \`twix_humanoid_create\` for a fast single-mesh offline body.
+  Add clothing with \`twix_garment_create\` (fitted shell) and \`twix_garment_bind\`.
+- **Curved, organic or manufactured props:** use \`twix_mesh_create\` (loft sections, revolve profile
+  or tube sweep) or \`twix_prop_create\` presets. Sections control the silhouette; shape 0 is round and
+  shape 1 is a rounded square. This is the correct way to get smooth, UV-mapped geometry.
+- **Hard-surface and architecture:** \`twix_building_create\` parts are acceptable, but join finished
+  assemblies with \`twix_object_join\` so the asset is a single mesh with material slots.
+- **Finish every asset:** smooth shading, generated UVs, sensible materials, validation, then export.
+  Report vertex/triangle counts and warn the user if an asset is still a blockout.
 5. **Never guess at imported assets.** Inspect them, preserve the original reference, and edit the
    editable working copy. Report what cannot be safely modified (e.g. single-mesh imports).
 6. **Textures:** create a material, generate/assign maps, assign the material to the right object or
@@ -1747,7 +1785,31 @@ Trusted workspace: **${trusted ? "ON ? full PC access" : "OFF ? workspace read-o
 10. Use GitHub proactively when related repositories, code, README files or assets would improve the result. Use coding_github_index_repo when a repository looks reusable so later prompts can find it in Global Learning. Reference and session context are supporting background; ignore them only when irrelevant.
 11. Recovery: a snapshot of the app source is saved before each prompt. If your edits stop the app or server from starting, run \`node scripts/recover-last.mjs\` to restore the latest snapshot, then reapply the intended change more carefully.
 12. Full refresh: after changing core app or server files, run \`node scripts/full-refresh.mjs\`. It reloads the window, restarts the supervised backend, and returns to the live Coding editor.
-${unitySection}`;
+${unitySection}
+## Creator Studio 3D + Photo framework
+
+This workspace is part of **Creator Studio**, which includes a live 3D applet and a Photo applet.
+When the user asks for a 3D model, asset, character, prop, building, texture or export, use the
+Creator Studio framework instead of faking it in code:
+
+- Call \`creator_studio_guide\` once to read the modelling standard.
+- \`creator_scene_list\` lists open 3D workspaces; \`creator_scene_tool\` runs any 3D scene tool
+  (\`humanoid_create\`, \`mesh_create\`, \`prop_create\`, \`building_create\`, \`foliage_create\`,
+  \`material_create\`, \`mesh_generate_uv\`, \`scene_validate\`, \`export_scene\`, ...).
+- Characters must be a single lofted mesh with a skeleton: use \`humanoid_create\`. Never build a
+  human from primitive cubes, spheres or capsules.
+- \`creator_3d_export\` exports the scene/selection and copies the GLB/FBX into this workspace
+  (default \`Assets/Models\`). Reference that file in the project.
+- \`creator_library_list\` searches the user's 3D Reference Library folder: every model, rig, animation clip
+  and texture they have registered in the 3D applet. Results include bone counts, clip counts, blendshape
+  counts and absolute paths. Use it before modelling a character, rig, prop or game asset.
+- \`creator_library_copy\` copies a library asset into this coding workspace (default \`Assets/Models\` or
+  \`Assets/Textures\`) so it can be used directly by the Unity project or a 3D game. The library is the
+  canonical place for reusable bone-rigged humans, animals, props and textures.
+- \`creator_3d_export\` exports the scene/selection and copies the GLB/FBX into this workspace
+  sprite or texture and saves the PNG into this workspace (default \`Assets/Textures\`). For layered
+  editing, point the user to the Photo applet.
+`;
 }
 
 function codingWorkspaceDir(projectId) {
@@ -1778,14 +1840,14 @@ async function writeCodingWorkspace(projectId, dir, trusted, unityPort = null) {
         },
       },
     },
-    tools: { "*": false, "coding_*": true, task: false },
+    tools: { "*": false, "coding_*": true, "creator_*": true, task: false },
     permission: { "*": "allow" },
     agent: {
       coder: {
         description: "Coding workspace agent scoped to the selected project directory.",
         mode: "primary",
         prompt: "{file:./AGENTS.md}",
-        tools: { "*": false, "coding_*": true, task: false },
+        tools: { "*": false, "coding_*": true, "creator_*": true, task: false },
       },
     },
   };
@@ -2892,6 +2954,551 @@ app.post("/api/chat/profiles", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* API: Twilight Studio Hub                                            */
+/* Private request threads and studio postings on the ngrok cloud.      */
+/* ------------------------------------------------------------------ */
+
+const HUB_PRIVATE_PREFIX = "CreatorStudio.Private.";
+const HUB_POSTINGS_CHANNEL = "CreatorStudio.Hub.Postings";
+const HUB_ADMIN_USERNAME = "twilightstudio.dev";
+const HUB_MAX_THREADS = 60;
+
+// The owner can edit these in the Hub. They are posted by TwilightStudio.Dev
+// immediately after a member opens a private thread from a preset button.
+const HUB_DEFAULT_AUTO_REPLIES = {
+  payment:
+    "Hi, TwilightStudio.Dev here. I have your payment setup request. Tell me which route you prefer - Wealthsimple, e-Transfer, PayPal or another option - and I will send the onboarding steps and any links you need.\n\n- KittyFangs.exe",
+  admin:
+    "Hi, TwilightStudio.Dev here. I received your admin request and will review the area and reason you listed. I will reply here with the access I can grant.\n\n- KittyFangs.exe",
+  moderation:
+    "Hi, TwilightStudio.Dev here. Thank you for the moderation report. I will review what happened and follow up privately in this thread.\n\n- KittyFangs.exe",
+  project:
+    "Hi, TwilightStudio.Dev here. Thank you for your interest in this project. I will review your skills and availability, then reply with the next step and the payment route for the role.\n\n- KittyFangs.exe",
+  "request-project":
+    "Hi, TwilightStudio.Dev here. I received your request for a new studio project posting. I will review the idea and scope and reply here if we can open it for the team.\n\n- KittyFangs.exe",
+  general:
+    "Hi, TwilightStudio.Dev here. I received your private message and will reply in this thread.\n\n- KittyFangs.exe",
+};
+
+function hubAutoReply(settings, preset) {
+  const saved = settings?.hub?.templates;
+  const wanted = String(preset || "general").toLowerCase();
+  if (saved && typeof saved === "object" && typeof saved[wanted] === "string" && saved[wanted].trim()) {
+    return saved[wanted].slice(0, 1500);
+  }
+  return HUB_DEFAULT_AUTO_REPLIES[wanted] || HUB_DEFAULT_AUTO_REPLIES.general;
+}
+let hubSequence = 0;
+
+function hubCleanUsername(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 20);
+}
+
+function hubChannelId(username) {
+  const clean = hubCleanUsername(username) || "Creator";
+  const random = randomBytes(4).toString("hex").toUpperCase();
+  return HUB_PRIVATE_PREFIX + clean + "_" + random;
+}
+
+function hubNormalizeChannel(record, fallbackId = "") {
+  if (!record) return null;
+  const id = String(record.id || record.__id || fallbackId || "").trim();
+  if (!id) return null;
+  return {
+    id,
+    name: String(record.n || record.name || id),
+    type: String(record.t || record.type || "private"),
+    server: String(record.sv || record.server || "CreatorStudio"),
+    description: String(record.d || record.desc || ""),
+    position: Number(record.pos || 0),
+  };
+}
+
+async function hubListChannels() {
+  const data = await chatServerFetch("/api/bitboy_chat_channels");
+  const records = data.records && typeof data.records === "object" ? data.records : {};
+  return Object.entries(records)
+    .map(([id, record]) => hubNormalizeChannel(record, id))
+    .filter(Boolean)
+    .filter((channel) => {
+      const id = channel.id.toLowerCase();
+      return id.startsWith(HUB_PRIVATE_PREFIX.toLowerCase()) || id === HUB_POSTINGS_CHANNEL.toLowerCase();
+    });
+}
+
+async function hubEnsureChannel(id, description, type = "private") {
+  const channels = await hubListChannels();
+  const found = channels.find((channel) => channel.id.toLowerCase() === id.toLowerCase());
+  if (found) return found;
+  const created = await chatServerFetch("/api/bitboy_chat_channels", {
+    method: "POST",
+    body: {
+      id,
+      n: id,
+      t: type,
+      sv: "CreatorStudio",
+      d: String(description || "").slice(0, 220),
+      pos: Date.now(),
+    },
+  });
+  return hubNormalizeChannel(created, id);
+}
+
+async function hubPostMessage(channel, username, kind, message, extra = {}) {
+  const payload = {
+    ch: channel,
+    i: Date.now() + (hubSequence++ % 1000),
+    u: hubCleanUsername(username) || "Creator",
+    pid: String(extra.accountId || ""),
+    t: kind,
+    m: String(message || ""),
+    ...Object.fromEntries(
+      Object.entries(extra).filter(([key]) => !["accountId"].includes(key) && extra[key] !== undefined),
+    ),
+  };
+  const data = await chatServerFetch("/api/bitboy_chat_messages", { method: "POST", body: payload });
+  return data;
+}
+
+async function hubChannelMessages(channel, limit = 80) {
+  const data = await chatServerFetch(
+    "/api/channels/" + encodeURIComponent(channel) + "/messages?newest=1&limit=" + Math.max(1, Math.min(100, limit)),
+  );
+  const messages = Array.isArray(data.messages) ? data.messages : [];
+  return messages
+    .map((message) => ({
+      id: String(message.id || message.__id || ""),
+      idx: Number(message.idx || message.i || message.ts || 0),
+      user: String(message.u || message.user || ""),
+      kind: String(message.t || message.kind || "msg"),
+      text: String(message.m || message.message || message.msg || ""),
+      to: String(message.to || ""),
+      at: Number(message.ts || message.t || message.idx || message.i || 0),
+    }))
+    .filter((message) => message.user)
+    .sort((a, b) => a.idx - b.idx);
+}
+
+async function hubAdminAllowed(username, accountId) {
+  if (String(username || "").trim().toLowerCase() !== HUB_ADMIN_USERNAME) return false;
+  const settings = await getSettings();
+  const owner = String(settings.hub?.ownerAccountId || "");
+  const account = String(accountId || "");
+  if (owner && account && account !== owner) return false;
+  if (!owner && account) {
+    await saveSettings({ hub: { ...settings.hub, ownerAccountId: account } });
+  }
+  return true;
+}
+
+function hubMetaFromMessages(messages) {
+  const metaMessage = messages.find((message) => message.kind === "hub-meta");
+  if (!metaMessage) return null;
+  try {
+    const parsed = JSON.parse(metaMessage.text);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function hubParticipants(messages, meta, creator) {
+  const participants = new Set();
+  const add = (value) => {
+    const clean = String(value || "").trim();
+    if (clean) participants.add(clean);
+  };
+  add(creator);
+  if (Array.isArray(meta?.participants)) meta.participants.forEach(add);
+  for (const message of messages) {
+    if (message.kind === "hub-invite" && message.to) add(message.to);
+    if (message.user) add(message.user);
+  }
+  add("TwilightStudio.Dev");
+  return [...participants];
+}
+
+async function hubLatestPostings() {
+  const postMessages = await hubChannelMessages(HUB_POSTINGS_CHANNEL, 100);
+  const deletedPosts = new Set(
+    postMessages.filter((message) => message.kind === "hub-post-delete").map((message) => message.text.trim()),
+  );
+  const byId = new Map();
+  for (const message of postMessages) {
+    if (message.kind !== "hub-post") continue;
+    try {
+      const post = JSON.parse(message.text);
+      if (!post || !post.id) continue;
+      const id = String(post.id);
+      if (deletedPosts.has(id)) continue;
+      byId.set(id, { ...post, id, at: message.idx });
+    } catch {}
+  }
+  return [...byId.values()].sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
+}
+
+app.get("/api/hub/overview", async (req, res) => {
+  try {
+    const username = hubCleanUsername(req.query.username);
+    const accountId = String(req.query.accountId || "");
+    if (!username) return res.status(400).json({ error: "username is required" });
+    const admin = await hubAdminAllowed(username, accountId);
+    const channels = await hubListChannels();
+    const privateChannels = channels
+      .filter((channel) => channel.id.toLowerCase().startsWith(HUB_PRIVATE_PREFIX.toLowerCase()))
+      .slice(0, HUB_MAX_THREADS);
+    const threads = [];
+    for (const channel of privateChannels) {
+      let messages = [];
+      try {
+        messages = await hubChannelMessages(channel.id, 80);
+      } catch {
+        continue;
+      }
+      const meta = hubMetaFromMessages(messages) || {};
+      const participants = hubParticipants(messages, meta, meta.creator || channel.name);
+      const creator = String(meta.creator || "").toLowerCase();
+      const deleted = messages.some((message) => message.kind === "hub-deleted");
+      const allowed =
+        admin ||
+        creator === username.toLowerCase() ||
+        participants.some((person) => person.toLowerCase() === username.toLowerCase());
+      if (!allowed) continue;
+      if (deleted && !admin) continue;
+      const last = messages[messages.length - 1];
+      threads.push({
+        id: channel.id,
+        subject: String(meta.subject || channel.description || "Private request"),
+        topic: String(meta.topic || meta.preset || "General"),
+        preset: String(meta.preset || "general"),
+        postingId: String(meta.postingId || ""),
+        creator: String(meta.creator || ""),
+        creatorAccountId: String(meta.creatorAccountId || ""),
+        participants,
+        status: deleted ? "deleted" : String(meta.status || "open"),
+        createdAt: String(meta.createdAt || ""),
+        lastAt: Number(last?.idx || 0),
+        lastAuthor: last?.user || "",
+        lastMessage: last?.text ? last.text.slice(0, 180) : "",
+        lastKind: last?.kind || "",
+        messageCount: messages.length,
+      });
+    }
+    threads.sort((a, b) => Number(b.lastAt || 0) - Number(a.lastAt || 0));
+
+    let postings = [];
+    try {
+      postings = await hubLatestPostings();
+    } catch {}
+
+    res.json({ ok: true, username, admin, threads, postings });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.get("/api/hub/templates", async (req, res) => {
+  try {
+    const username = hubCleanUsername(req.query.username);
+    if (!(await hubAdminAllowed(username, req.query.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can read the auto-reply templates." });
+    }
+    const settings = await getSettings();
+    const saved = settings.hub?.templates && typeof settings.hub.templates === "object" ? settings.hub.templates : {};
+    res.json({ ok: true, templates: { ...HUB_DEFAULT_AUTO_REPLIES, ...saved } });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/templates", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = hubCleanUsername(body.username);
+    if (!(await hubAdminAllowed(username, body.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can edit the auto-reply templates." });
+    }
+    const incoming = body.templates && typeof body.templates === "object" ? body.templates : {};
+    const templates = {};
+    for (const [key, value] of Object.entries(incoming)) {
+      const id = String(key || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 40);
+      if (!id) continue;
+      templates[id] = String(value || "").slice(0, 1500);
+    }
+    const settings = await getSettings();
+    await saveSettings({ hub: { ...settings.hub, templates } });
+    log("info", "hub", "auto-reply templates saved", { keys: Object.keys(templates).length });
+    res.json({ ok: true, templates: { ...HUB_DEFAULT_AUTO_REPLIES, ...templates } });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/thread", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = hubCleanUsername(body.username);
+    const accountId = String(body.accountId || "");
+    if (!username) return res.status(400).json({ error: "username is required" });
+    const subject = String(body.subject || "Private request").trim().slice(0, 120) || "Private request";
+    const topic = String(body.topic || body.preset || "General").trim().slice(0, 60);
+    const preset = String(body.preset || "general").trim().slice(0, 40);
+    const postingId = String(body.postingId || "").trim();
+    const message = String(body.message || "").trim();
+    if (!message) return res.status(400).json({ error: "Write a message before opening the thread." });
+    const channel = hubChannelId(username);
+    await hubEnsureChannel(channel, subject + " — " + topic, "private");
+    const meta = {
+      id: channel,
+      subject,
+      topic,
+      preset,
+      postingId,
+      creator: username,
+      creatorAccountId: accountId,
+      participants: [username, "TwilightStudio.Dev"],
+      createdAt: new Date().toISOString(),
+      status: "open",
+    };
+    await hubPostMessage(channel, username, "hub-meta", JSON.stringify(meta), { accountId });
+    await hubPostMessage(channel, username, "hub-message", message, { accountId, subject });
+
+    // The owner's custom message is delivered automatically so the member never
+    // waits for a manual first reply. A project posting can override the preset.
+    const admin = await hubAdminAllowed(username, accountId);
+    if (!admin) {
+      const settings = await getSettings();
+      let autoReply = hubAutoReply(settings, preset);
+      if (postingId) {
+        try {
+          const postings = await hubLatestPostings();
+          const posting = postings.find((item) => String(item.id) === postingId);
+          if (posting?.ownerMessage) autoReply = String(posting.ownerMessage).slice(0, 1500);
+        } catch {}
+      }
+      if (autoReply) {
+        await hubPostMessage(channel, "TwilightStudio.Dev", "hub-message", autoReply, {
+          accountId: settings.hub?.ownerAccountId || "",
+          subject,
+        });
+      }
+    }
+
+    log("info", "hub", "thread opened", { channel, username, topic, postingId });
+    res.json({ ok: true, channel, meta });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/message", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const channel = String(body.channel || "").trim();
+    const username = hubCleanUsername(body.username);
+    const accountId = String(body.accountId || "");
+    if (!channel.toLowerCase().startsWith(HUB_PRIVATE_PREFIX.toLowerCase())) {
+      return res.status(400).json({ error: "This is not a private Hub thread." });
+    }
+    if (!username) return res.status(400).json({ error: "username is required" });
+    const text = String(body.message || "").trim();
+    if (!text) return res.status(400).json({ error: "message is required" });
+    const messages = await hubChannelMessages(channel, 100);
+    const meta = hubMetaFromMessages(messages) || {};
+    const participants = hubParticipants(messages, meta, meta.creator || "");
+    const admin = await hubAdminAllowed(username, accountId);
+    const allowed =
+      admin ||
+      String(meta.creator || "").toLowerCase() === username.toLowerCase() ||
+      participants.some((person) => person.toLowerCase() === username.toLowerCase());
+    if (!allowed) return res.status(403).json({ error: "You are not part of this thread." });
+    await hubPostMessage(channel, username, "hub-message", text, { accountId, subject: meta.subject || "" });
+    log("info", "hub", "thread message", { channel, username });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/thread/invite", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const channel = String(body.channel || "").trim();
+    const username = hubCleanUsername(body.username);
+    const invitee = hubCleanUsername(body.invitee);
+    if (!channel.toLowerCase().startsWith(HUB_PRIVATE_PREFIX.toLowerCase())) {
+      return res.status(400).json({ error: "This is not a private Hub thread." });
+    }
+    if (!(await hubAdminAllowed(username, body.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can invite people to a private thread." });
+    }
+    if (!invitee) return res.status(400).json({ error: "Invitee username is required." });
+    await hubPostMessage(channel, username, "hub-invite", "Invited " + invitee + " to this private thread.", {
+      accountId: body.accountId,
+      to: invitee,
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/thread/delete", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const channel = String(body.channel || "").trim();
+    const username = hubCleanUsername(body.username);
+    if (!channel.toLowerCase().startsWith(HUB_PRIVATE_PREFIX.toLowerCase())) {
+      return res.status(400).json({ error: "This is not a private Hub thread." });
+    }
+    if (!(await hubAdminAllowed(username, body.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can delete a private thread." });
+    }
+    await hubPostMessage(channel, username, "hub-deleted", "TwilightStudio.Dev closed and deleted this thread.", {
+      accountId: body.accountId,
+    });
+    // Try the cloud delete endpoint too. When it is unavailable the deleted
+    // marker still hides the thread from every non-owner member.
+    await chatServerFetch("/api/bitboy_chat_channels/" + encodeURIComponent(channel), { method: "DELETE" }).catch(() => null);
+    log("info", "hub", "thread deleted", { channel, username });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/post", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = hubCleanUsername(body.username);
+    if (!(await hubAdminAllowed(username, body.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can publish studio postings." });
+    }
+    const post = body.post && typeof body.post === "object" ? body.post : {};
+    const title = String(post.title || "").trim().slice(0, 120);
+    if (!title) return res.status(400).json({ error: "Posting title is required." });
+    const id = String(post.id || "post-" + Date.now().toString(36) + "-" + randomBytes(2).toString("hex")).slice(0, 60);
+    let previous = null;
+    if (post.id) {
+      try {
+        const existing = await hubLatestPostings();
+        previous = existing.find((item) => String(item.id) === id) || null;
+      } catch {}
+    }
+    const payload = {
+      id,
+      title,
+      summary: String(post.summary || "").slice(0, 400),
+      description: String(post.description || "").slice(0, 6000),
+      role: String(post.role || "Contributor").slice(0, 80),
+      status: String(post.status || "open").slice(0, 30),
+      author: "TwilightStudio.Dev",
+      contactMessage: String(post.contactMessage || "").slice(0, 1500),
+      ownerMessage: String(post.ownerMessage || "").slice(0, 1500),
+      assignments: Array.isArray(previous?.assignments) ? previous.assignments : [],
+      paymentNotes: String(post.paymentNotes || "").slice(0, 1500),
+      links: Array.isArray(post.links)
+        ? post.links.map((link) => String(link || "").trim()).filter(Boolean).slice(0, 12)
+        : String(post.links || "").split(/\n+/).map((line) => line.trim()).filter(Boolean).slice(0, 12),
+      tags: Array.isArray(post.tags) ? post.tags.map((tag) => String(tag).slice(0, 30)).slice(0, 8) : [],
+      createdAt: String(previous?.createdAt || new Date().toISOString()),
+      updatedAt: new Date().toISOString(),
+    };
+    await hubEnsureChannel(HUB_POSTINGS_CHANNEL, "Twilight Studio Hub postings", "hub");
+    await hubPostMessage(HUB_POSTINGS_CHANNEL, username, "hub-post", JSON.stringify(payload), { accountId: body.accountId });
+    log("info", "hub", "posting published", { id, title });
+    res.json({ ok: true, post: payload });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/post/assign", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = hubCleanUsername(body.username);
+    if (!(await hubAdminAllowed(username, body.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can assign people to a project." });
+    }
+    const postId = String(body.postId || "").trim();
+    const assigneeUsername = hubCleanUsername(body.assignee?.username || body.assigneeUsername);
+    const role = String(body.role || "").trim().slice(0, 80);
+    if (!postId) return res.status(400).json({ error: "Choose a project first." });
+    if (!assigneeUsername) return res.status(400).json({ error: "Choose a member to assign." });
+    const postings = await hubLatestPostings();
+    const post = postings.find((item) => String(item.id) === postId);
+    if (!post) return res.status(404).json({ error: "That project posting no longer exists." });
+    const assignments = Array.isArray(post.assignments) ? [...post.assignments] : [];
+    const filtered = assignments.filter(
+      (item) => String(item.username || "").toLowerCase() !== assigneeUsername.toLowerCase(),
+    );
+    if (role) {
+      filtered.push({
+        username: assigneeUsername,
+        name: String(body.assignee?.name || assigneeUsername).slice(0, 40),
+        avatar: String(body.assignee?.avatar || "").slice(0, 400000),
+        border: String(body.assignee?.border || "electric").slice(0, 24),
+        role,
+        assignedAt: new Date().toISOString(),
+      });
+    }
+    const next = { ...post, assignments: filtered, updatedAt: new Date().toISOString() };
+    delete next.at;
+    await hubPostMessage(HUB_POSTINGS_CHANNEL, username, "hub-post", JSON.stringify(next), {
+      accountId: body.accountId,
+    });
+    log("info", "hub", "project assignment", { postId, assigneeUsername, role, removed: !role });
+    res.json({ ok: true, post: next });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/post/delete", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = hubCleanUsername(body.username);
+    if (!(await hubAdminAllowed(username, body.accountId))) {
+      return res.status(403).json({ error: "Only TwilightStudio.Dev can remove a posting." });
+    }
+    const id = String(body.id || "").trim();
+    if (!id) return res.status(400).json({ error: "Posting id is required." });
+    await hubPostMessage(HUB_POSTINGS_CHANNEL, username, "hub-post-delete", id, { accountId: body.accountId });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/hub/claim", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const username = hubCleanUsername(body.username);
+    const accountId = String(body.accountId || "");
+    if (!username) return res.status(400).json({ error: "username is required" });
+    if (username.toLowerCase() === HUB_ADMIN_USERNAME) {
+      const allowed = await hubAdminAllowed(username, accountId);
+      if (!allowed) {
+        return res.status(409).json({ error: "TwilightStudio.Dev is reserved for the studio owner account." });
+      }
+      return res.json({ ok: true, admin: true });
+    }
+    const data = await chatServerFetch("/api/creator_chat_profiles").catch(() => ({ records: {} }));
+    const records = data.records && typeof data.records === "object" ? data.records : {};
+    const conflict = Object.values(records).find((profile) => {
+      const name = String(profile?.u || profile?.username || "").toLowerCase();
+      if (name !== username.toLowerCase()) return false;
+      const owner = String(profile.accountId || "");
+      return accountId ? owner !== accountId : true;
+    });
+    if (conflict) return res.status(409).json({ error: "That username is already taken. Choose another one." });
+    res.json({ ok: true, admin: false });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* API: coding workspace                                               */
 /* ------------------------------------------------------------------ */
 
@@ -3262,7 +3869,7 @@ app.post("/api/coding/prompt", async (req, res) => {
       linkedRepo
         ? `Linked GitHub repository: ${linkedRepo.fullName} (branch ${linkedRepo.branch || linkedRepo.defaultBranch}). The link manifest is .twix/github.json. Use the coding_github_* tools with this owner/repo when the user asks to push or pull, search, read or download files.`
         : "No GitHub repository is linked in the coding sidebar. If the workspace already has a .git/config remote, inspect it before assuming there is none; otherwise do not push or pull until the user links one.",
-      "GitHub safety: files over 25 MB and batches over 50 MB are blocked before GitHub can lock the repository. Never push binary textures or audio through coding_github_push_files; use coding_github_download_file or coding_download_url to bring assets into the workspace, then commit small text changes.",
+      "GitHub safety: Git LFS is enabled for large assets. Files over 20 MB are uploaded through the LFS batch API and committed as pointer files, so textures, audio and models are no longer blocked. Keep a single file under 2 GB, and prefer small focused commits for text files.",
       "GitHub awareness: use coding_github_search_code, coding_github_search_repositories, coding_github_repo_tree and coding_github_read_file (exact names) to inspect repositories. Pull exact files with coding_github_download_file. Use coding_download_url only when the user asks for an external asset download.",
       "Reference Library: coding_reference_search_local searches indexed folders and files, coding_reference_search_urls searches saved documentation, coding_reference_search_github searches repositories already indexed into Global Learning, coding_reference_status reports coverage and coding_reference_index_source re-indexes a saved folder or link. Use coding_reference_read to open a match before assuming there is no local documentation.",
     ].join("\n");
@@ -4097,6 +4704,177 @@ app.post("/api/providers/image", async (req, res) => {
     return res.status(400).json({ error: "Unsupported image provider" });
   } catch (error) {
     log("error", "providers", "image generation failed", { message: error.message });
+    res.status(502).json({ error: error.message });
+  }
+});
+
+
+/* ------------------------------------------------------------------ */
+/* AI 3D generation (Meshy / Tripo)                                    */
+/* ------------------------------------------------------------------ */
+
+function ai3dSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new Error("3D generation timed out."));
+      }, { once: true });
+    }
+  });
+}
+
+async function meshyTextTo3D(apiKey, prompt, options, signal) {
+  const base = "https://api.meshy.ai/openapi/v2/text-to-3d";
+  const headers = { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" };
+  const create = async (body) => {
+    const response = await fetch(base, { method: "POST", headers, body: JSON.stringify(body), signal });
+    const json = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(json.message || json.error || "Meshy request failed (HTTP " + response.status + ")");
+    if (!json.result) throw new Error("Meshy returned no task id.");
+    return json.result;
+  };
+  const poll = async (id) => {
+    for (let attempt = 0; attempt < 88; attempt++) {
+      await ai3dSleep(3000, signal);
+      const response = await fetch(base + "/" + encodeURIComponent(id), { headers, signal });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(json.message || json.error || "Meshy poll failed (HTTP " + response.status + ")");
+      const status = String(json.status || "").toUpperCase();
+      if (status === "SUCCEEDED") return json;
+      if (["FAILED", "EXPIRED", "CANCELED", "CANCELLED"].includes(status)) {
+        throw new Error(json.task_error?.message || json.message || "Meshy task failed.");
+      }
+    }
+    throw new Error("Meshy task timed out.");
+  };
+  const model = options.model || "meshy-6";
+  const previewId = await create({
+    mode: "preview",
+    prompt,
+    ai_model: model,
+    should_remesh: true,
+    topology: "triangle",
+    target_polycount: Number(options.polycount || 30000),
+  });
+  let result = await poll(previewId);
+  let urls = result.model_urls || {};
+  if (options.texture !== false) {
+    const refineId = await create({ mode: "refine", preview_task_id: previewId, ai_model: model, enable_pbr: true });
+    result = await poll(refineId);
+    urls = result.model_urls || urls;
+  }
+  const url = urls.glb || urls.fbx;
+  if (!url) throw new Error("Meshy finished without a GLB URL.");
+  return { url, taskId: previewId, provider: "meshy", model };
+}
+
+async function tripoTextTo3D(apiKey, prompt, options, signal) {
+  const base = "https://api.tripo3d.ai/v2/openapi/task";
+  const headers = { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" };
+  const model = options.model || "v3.1-20260211";
+  const submit = await fetch(base, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      type: "text_to_model",
+      prompt,
+      model_version: model,
+      texture: options.texture !== false,
+      pbr: options.texture !== false,
+      face_limit: Number(options.polycount || 30000),
+    }),
+    signal,
+  });
+  const submitJson = await submit.json().catch(() => ({}));
+  if (!submit.ok || (submitJson.code !== undefined && submitJson.code !== 0)) {
+    throw new Error(submitJson.message || submitJson.error || "Tripo request failed (HTTP " + submit.status + ")");
+  }
+  const taskId = submitJson.data?.task_id;
+  if (!taskId) throw new Error("Tripo returned no task id.");
+  for (let attempt = 0; attempt < 88; attempt++) {
+    await ai3dSleep(3000, signal);
+    const response = await fetch(base + "/" + encodeURIComponent(taskId), { headers, signal });
+    const json = await response.json().catch(() => ({}));
+    const data = json.data || {};
+    const status = String(data.status || "").toLowerCase();
+    if (status === "success" || status === "succeeded") {
+      const output = data.output || {};
+      const resultObj = data.result || {};
+      const pick = (token) => {
+        if (!token) return "";
+        if (typeof token === "string") return token;
+        return token.url || "";
+      };
+      const url =
+        pick(output.pbr_model) ||
+        pick(resultObj.pbr_model) ||
+        pick(output.model) ||
+        pick(resultObj.model) ||
+        pick(output.base_model) ||
+        pick(resultObj.base_model);
+      if (!url) throw new Error("Tripo finished without a model URL.");
+      return { url, taskId, provider: "tripo", model };
+    }
+    if (["failed", "error", "cancelled", "canceled", "banned", "expired"].includes(status)) {
+      throw new Error(data.error || data.message || json.message || "Tripo task failed.");
+    }
+  }
+  throw new Error("Tripo task timed out.");
+}
+
+async function downloadAi3dModel(projectId, url, extension = "glb") {
+  const entry = await loadProjectById(projectId);
+  const refs = path.join(entry.path, "references");
+  await ensureDir(refs);
+  const fileName = "ai3d-" + Date.now() + "." + extension;
+  const target = path.join(refs, fileName);
+  const response = await fetch(url, { signal: AbortSignal.timeout(180000) });
+  if (!response.ok) throw new Error("Could not download the generated model (HTTP " + response.status + ").");
+  const bytes = Buffer.from(await response.arrayBuffer());
+  await fs.writeFile(target, bytes);
+  return { path: fileName, bytes: bytes.length };
+}
+
+app.post("/api/ai3d/generate", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const { prompt, provider, projectId, texture = true, model, polycount } = req.body || {};
+    if (!prompt || !String(prompt).trim()) return res.status(400).json({ error: "A prompt is required." });
+    if (!projectId) return res.status(400).json({ error: "A project is required." });
+    const meshyKey = settings.providers?.meshy?.apiKey || "";
+    const tripoKey = settings.providers?.tripo?.apiKey || "";
+    const chosen = provider || (meshyKey ? "meshy" : tripoKey ? "tripo" : "");
+    if (!chosen) {
+      return res.status(400).json({
+        error: "Add a Meshy or Tripo API key in Settings > Providers to generate AI 3D models.",
+      });
+    }
+    const signal = AbortSignal.timeout(285000);
+    let result;
+    if (chosen === "meshy") {
+      if (!meshyKey) return res.status(400).json({ error: "Meshy API key is not configured." });
+      result = await meshyTextTo3D(meshyKey, String(prompt), {
+        texture,
+        model: model || settings.providers?.meshy?.model,
+        polycount,
+      }, signal);
+    } else if (chosen === "tripo") {
+      if (!tripoKey) return res.status(400).json({ error: "Tripo API key is not configured." });
+      result = await tripoTextTo3D(tripoKey, String(prompt), {
+        texture,
+        model: model || settings.providers?.tripo?.model,
+        polycount,
+      }, signal);
+    } else {
+      return res.status(400).json({ error: "Unsupported 3D provider. Use meshy or tripo." });
+    }
+    const saved = await downloadAi3dModel(projectId, result.url, "glb");
+    log("info", "ai3d", "generated", { provider: chosen, taskId: result.taskId, bytes: saved.bytes });
+    res.json({ ok: true, provider: chosen, model: result.model, path: saved.path, bytes: saved.bytes, taskId: result.taskId });
+  } catch (error) {
+    log("error", "ai3d", "generation failed", { message: error.message });
     res.status(502).json({ error: error.message });
   }
 });
@@ -6321,7 +7099,13 @@ app.get("/api/github/repos/:owner/:repo/file", async (req, res) => {
     if (!data || Array.isArray(data) || data.type !== "file") {
       return res.status(400).json({ error: "The selected path is not a file." });
     }
-    const buffer = Buffer.from(String(data.content || ""), data.encoding === "base64" ? "base64" : "utf8");
+    let buffer = Buffer.from(String(data.content || ""), data.encoding === "base64" ? "base64" : "utf8");
+    if (isLfsPointer(buffer)) {
+      const pointer = parseLfsPointer(buffer);
+      const settings = await getSettings();
+      const token = githubPrimaryToken(settings);
+      if (pointer && token) buffer = await lfsDownloadObject(owner, repo, token, pointer.oid, pointer.size);
+    }
     const isBinary = buffer.includes(0);
     if (!isBinary) void rememberGithubFile(owner, repo, data.path, buffer.toString("utf8"), data.html_url);
     res.json({
@@ -6331,7 +7115,7 @@ app.get("/api/github/repos/:owner/:repo/file", async (req, res) => {
       ref,
       content: isBinary ? "" : buffer.toString("utf8"),
       binary: isBinary,
-      bytes: data.size || buffer.length,
+      bytes: buffer.length,
       sha: data.sha,
       htmlUrl: data.html_url,
     });
@@ -6351,10 +7135,16 @@ app.get("/api/github/repos/:owner/:repo/download", async (req, res) => {
     if (!data || Array.isArray(data) || data.type !== "file") {
       return res.status(400).json({ error: "The selected path is not a file." });
     }
-    const buffer = Buffer.from(String(data.content || ""), data.encoding === "base64" ? "base64" : "utf8");
-    if (buffer.length > GITHUB_MAX_FILE_BYTES) {
+    let buffer = Buffer.from(String(data.content || ""), data.encoding === "base64" ? "base64" : "utf8");
+    if (isLfsPointer(buffer)) {
+      const pointer = parseLfsPointer(buffer);
+      const settings = await getSettings();
+      const token = githubPrimaryToken(settings);
+      if (pointer && token) buffer = await lfsDownloadObject(owner, repo, token, pointer.oid, pointer.size);
+    }
+    if (buffer.length > GITHUB_MAX_DOWNLOAD_BYTES) {
       return res.status(413).json({
-        error: `File is ${(buffer.length / 1024 / 1024).toFixed(1)} MB. Downloads are capped at 25 MB for workspace safety.`,
+        error: `File is ${(buffer.length / 1024 / 1024).toFixed(0)} MB. Downloads are capped at 2 GB.`,
       });
     }
     if (!buffer.includes(0)) void rememberGithubFile(owner, repo, data.path, buffer.toString("utf8"));
@@ -6592,20 +7382,47 @@ function githubRefPath(branch) {
  * A failed file is recorded and skipped instead of aborting the whole commit:
  * every file that is under the limits still gets pushed.
  */
-async function githubUploadBlobs(owner, repo, changes) {
+async function githubUploadBlobs(owner, repo, changes, options = {}) {
+  const settings = options.settings || (await getSettings());
+  const token = githubPrimaryToken(settings);
   const entries = [];
   const failed = [];
+  const lfsPaths = [];
   let consecutiveRateLimits = 0;
   for (let index = 0; index < changes.length; index++) {
     const item = changes[index];
     if (index > 0) await new Promise((resolve) => setTimeout(resolve, 200));
-    const binary = item.buffer.includes(0);
+    let buffer = item.buffer;
+    if (buffer.length > GITHUB_LFS_THRESHOLD_BYTES) {
+      if (!token) {
+        failed.push({
+          path: item.path,
+          bytes: buffer.length,
+          reason: "Connect GitHub before uploading large files through Git LFS.",
+        });
+        continue;
+      }
+      if (buffer.length > GITHUB_LFS_MAX_BYTES) {
+        failed.push({ path: item.path, bytes: buffer.length, reason: "File exceeds the 2 GB LFS limit." });
+        continue;
+      }
+      try {
+        const pointer = await lfsUploadBuffer(owner, repo, token, buffer);
+        buffer = Buffer.from(pointer, "utf8");
+        lfsPaths.push(item.path);
+      } catch (error) {
+        failed.push({ path: item.path, bytes: buffer.length, reason: "Git LFS: " + error.message });
+        log("warning", "github", "lfs upload failed", { path: item.path, message: error.message });
+        continue;
+      }
+    }
+    const binary = buffer.includes(0);
     try {
-      const sha = await githubCreateBlob(owner, repo, item.buffer, binary);
+      const sha = await githubCreateBlob(owner, repo, buffer, binary);
       entries.push({ path: item.path, mode: "100644", type: "blob", sha });
       consecutiveRateLimits = 0;
     } catch (error) {
-      failed.push({ path: item.path, bytes: item.buffer.length, reason: error.message });
+      failed.push({ path: item.path, bytes: buffer.length, reason: error.message });
       log("warning", "github", "blob upload failed", { path: item.path, message: error.message });
       if (githubIsRateLimited(error)) {
         consecutiveRateLimits++;
@@ -6624,7 +7441,42 @@ async function githubUploadBlobs(owner, repo, changes) {
       }
     }
   }
-  return { entries, failed };
+  return { entries, failed, lfsPaths };
+}
+
+/** Resolve Git LFS pointers into real bytes while pulling. */
+async function githubReadBlobBytes(owner, repo, sha, settings) {
+  const blob = await githubApi(githubRepoApi(owner, repo, "/git/blobs/" + encodeURIComponent(sha)), {
+    timeoutMs: 180000,
+  });
+  let buffer = Buffer.from(String(blob.data?.content || ""), "base64");
+  if (isLfsPointer(buffer)) {
+    const pointer = parseLfsPointer(buffer);
+    const token = githubPrimaryToken(settings || (await getSettings()));
+    if (pointer && token) {
+      buffer = await lfsDownloadObject(owner, repo, token, pointer.oid, pointer.size);
+    }
+  }
+  return buffer;
+}
+
+/** Add or extend .gitattributes so GitHub and git-lfs treat the files as LFS. */
+async function githubLfsAttributesEntry(owner, repo, lfsPaths, state, localText) {
+  if (!Array.isArray(lfsPaths) || !lfsPaths.length) return null;
+  let existing = localText;
+  if (existing === undefined) {
+    const sha = state?.remote?.get(".gitattributes");
+    if (sha) {
+      try {
+        const blob = await githubApi(githubRepoApi(owner, repo, "/git/blobs/" + encodeURIComponent(sha)));
+        existing = Buffer.from(String(blob.data?.content || ""), "base64").toString("utf8");
+      } catch {}
+    }
+  }
+  const merged = mergeLfsAttributes(existing || "", lfsPaths);
+  const buffer = Buffer.from(merged, "utf8");
+  const sha = await githubCreateBlob(owner, repo, buffer, false);
+  return { path: ".gitattributes", mode: "100644", type: "blob", sha };
 }
 
 async function githubDefaultBranch(owner, repo) {
@@ -6799,7 +7651,8 @@ app.post("/api/github/pull", async (req, res) => {
     const skipped = [];
     const failed = [];
     let bytes = 0;
-    const MAX_PULL_BYTES = 200 * 1024 * 1024;
+    const MAX_PULL_BYTES = GITHUB_MAX_DOWNLOAD_BYTES;
+    const pullSettings = await getSettings();
 
     for (const entry of selected) {
       const relative =
@@ -6817,11 +7670,11 @@ app.post("/api/github/pull", async (req, res) => {
         skipped.push({ path: entry.path, reason: "Ignored folder." });
         continue;
       }
-      if (Number(entry.size || 0) > GITHUB_MAX_FILE_BYTES) {
+      if (Number(entry.size || 0) > GITHUB_LFS_MAX_BYTES) {
         skipped.push({
           path: entry.path,
           bytes: entry.size,
-          reason: "Larger than the 25 MB safe file limit.",
+          reason: "Larger than the 2 GB limit.",
         });
         continue;
       }
@@ -6830,23 +7683,19 @@ app.post("/api/github/pull", async (req, res) => {
         continue;
       }
       try {
-        const blob = await githubApi(
-          githubRepoApi(owner, repo, "/git/blobs/" + encodeURIComponent(entry.sha)),
-          { timeoutMs: 120000 },
-        );
-        const buffer = Buffer.from(String(blob.data?.content || ""), "base64");
-        if (buffer.length > GITHUB_MAX_FILE_BYTES) {
+        const buffer = await githubReadBlobBytes(owner, repo, entry.sha, pullSettings);
+        if (buffer.length > GITHUB_LFS_MAX_BYTES) {
           skipped.push({
             path: entry.path,
             bytes: buffer.length,
-            reason: "Larger than the 25 MB safe file limit.",
+            reason: "Larger than the 2 GB limit.",
           });
           continue;
         }
         if (bytes + buffer.length > MAX_PULL_BYTES) {
           return res.status(413).json({
             error:
-              "This pull exceeds the 200 MB safe limit. Pull a smaller folder, or pull the rest in a second pass.",
+              "This pull exceeds the 2 GB safe limit. Pull a smaller folder, or pull the rest in a second pass.",
           });
         }
         await fs.mkdir(path.dirname(dest), { recursive: true });
@@ -6906,16 +7755,10 @@ app.post("/api/github/push", async (req, res) => {
       (item) => !item.path || item.path.split("/").some((part) => part === ".." || part === ""),
     );
     if (badPath) return res.status(400).json({ error: "Invalid file path: " + String(badPath.path || "") });
-    const oversized = sized.find((item) => item.bytes > GITHUB_MAX_FILE_BYTES);
+    const oversized = sized.find((item) => item.bytes > GITHUB_LFS_MAX_BYTES);
     if (oversized) {
       return res.status(413).json({
-        error: `Push blocked: ${oversized.path} is ${(oversized.bytes / 1024 / 1024).toFixed(1)} MB. The safe limit is 25 MB per file; GitHub rejects much larger files and can make the repository unpushable.`,
-      });
-    }
-    const totalBytes = sized.reduce((total, item) => total + item.bytes, 0);
-    if (totalBytes > GITHUB_MAX_BATCH_BYTES) {
-      return res.status(413).json({
-        error: `Push blocked: the batch is ${(totalBytes / 1024 / 1024).toFixed(1)} MB. The safe limit is 50 MB per push; split the files into smaller commits.`,
+        error: `Push blocked: ${oversized.path} is ${(oversized.bytes / 1024 / 1024).toFixed(0)} MB. Git LFS accepts up to 2 GB per file.`,
       });
     }
 
@@ -6943,7 +7786,12 @@ app.post("/api/github/push", async (req, res) => {
       changed.push({ path: item.path, buffer });
     }
 
-    const { entries, failed } = await githubUploadBlobs(owner, repo, changed);
+    const settingsForPush = await getSettings();
+    const { entries, failed, lfsPaths } = await githubUploadBlobs(owner, repo, changed, {
+      settings: settingsForPush,
+    });
+    const attributes = await githubLfsAttributesEntry(owner, repo, lfsPaths, state);
+    if (attributes && !entries.some((entry) => entry.path === ".gitattributes")) entries.push(attributes);
 
     let commit = { commitSha: state.headSha, commitUrl: "", skipped: true };
     if (entries.length || !state.headSha) {
@@ -6991,7 +7839,7 @@ app.post("/api/github/push", async (req, res) => {
       repoSizeKb,
       warning,
       limits: {
-        maxFileBytes: GITHUB_MAX_FILE_BYTES,
+        maxFileBytes: GITHUB_LFS_MAX_BYTES,
         maxBatchBytes: GITHUB_MAX_BATCH_BYTES,
         repoWarnBytes: GITHUB_REPO_WARN_BYTES,
       },
@@ -7106,16 +7954,16 @@ app.post("/api/github/sync", async (req, res) => {
     await walk(root);
 
     const largeFiles = files
-      .filter((item) => item.bytes > GITHUB_MAX_FILE_BYTES)
+      .filter((item) => item.bytes > GITHUB_LFS_THRESHOLD_BYTES)
       .map((item) => ({
         path: item.path,
         bytes: item.bytes,
         mb: Number((item.bytes / 1024 / 1024).toFixed(2)),
       }));
-    // Files above the safe per-file limit are never sent to GitHub. They are
-    // reported in github_notpushed.txt instead of blocking the whole push.
+    // Every file is eligible now. Files above the LFS threshold are uploaded to
+    // Git LFS and committed as small pointer files.
     const allowed = files
-      .filter((item) => item.bytes <= GITHUB_MAX_FILE_BYTES)
+      .filter((item) => item.bytes <= GITHUB_LFS_MAX_BYTES)
       .sort((a, b) => a.path.localeCompare(b.path));
     // A single tree commit comfortably handles a few thousand entries; this is a
     // guard rail, not a target.
@@ -7183,12 +8031,19 @@ app.post("/api/github/sync", async (req, res) => {
         maxFiles: MAX_SYNC_FILES,
         remoteTreeTruncated: state.truncated,
         deleteSkipped: Boolean(deleteMissing) && !canDelete,
-        skippedLarge: largeFiles,
+        lfsFiles: largeFiles,
         skippedIgnored,
       });
     }
 
-    const { entries, failed } = await githubUploadBlobs(owner, repo, changed);
+    const { entries, failed, lfsPaths } = await githubUploadBlobs(owner, repo, changed);
+    let localAttributes = "";
+    try {
+      localAttributes = await fs.readFile(path.join(root, ".gitattributes"), "utf8");
+    } catch {}
+    const attributes = await githubLfsAttributesEntry(owner, repo, lfsPaths, state, localAttributes);
+    if (attributes && !entries.some((entry) => entry.path === ".gitattributes")) entries.push(attributes);
+    if (lfsPaths.length) localPaths.add(".gitattributes");
     const pushedSet = new Set(entries.map((entry) => entry.path));
     const pushedPaths = [...pushedSet];
     const pushedBytes = changed
@@ -7241,13 +8096,8 @@ app.post("/api/github/sync", async (req, res) => {
     // 6. Build the "not pushed" report and leave it in the workspace so the user
     // can see exactly what is still missing from GitHub.
     const notPushed = [];
-    for (const item of largeFiles) {
-      notPushed.push({
-        path: item.path,
-        bytes: item.bytes,
-        reason: "Larger than the 25 MB safe per-file limit (" + item.mb + " MB)",
-      });
-    }
+    // Large files are uploaded through Git LFS. Only real failures belong in the
+    // report, so the old "skipped large file" entries are gone.
     for (const item of cappedFiles) {
       notPushed.push({
         path: item.path,
@@ -7391,7 +8241,7 @@ app.post("/api/github/sync", async (req, res) => {
       repoSizeEstimated,
       remoteTreeTruncated: state.truncated,
       deleteSkipped: !cleanMode && Boolean(deleteMissing) && !canDelete,
-      skippedLarge: largeFiles,
+      lfsFiles: largeFiles,
       skippedIgnored,
     });
   } catch (error) {
@@ -7570,6 +8420,7 @@ app.post("/api/opencode/prompt", async (req, res) => {
 
     const system = [
       "You are operating the live TwiX 3D scene. Use twix_* tools to inspect and change the scene.",
+      "Finish models as continuous vertex-built surfaces. Use twix_ai_model_generate for Tripo/Meshy-class results when a provider key exists; otherwise use twix_humanoid_create for people and twix_mesh_create/twix_prop_create for props. Primitives are blockout-only; never build a character from cubes, capsules or spheres.",
       `Active studio: ${workspace}. Project units: ${context.units || "m"}.`,
       context.selection?.length ? `Current selection: ${context.selection.join(", ")}.` : "Nothing is selected.",
       context.sceneSummary ? `Scene summary:\n${context.sceneSummary}` : "",
@@ -7660,6 +8511,267 @@ app.post("/api/opencode/permission", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* 3D reference library                                                */
+/* ------------------------------------------------------------------ */
+
+const STUDIO3D_MODEL_EXTS = new Set(["fbx", "glb", "gltf", "obj", "stl", "dae", "3ds", "ply"]);
+const STUDIO3D_TEXTURE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "bmp", "tga", "gif", "hdr", "exr", "ktx2", "svg"]);
+const STUDIO3D_ANIMATION_EXTS = new Set(["anim", "bvh", "fbx"]);
+const STUDIO3D_SKIP = new Set([
+  "node_modules",
+  ".git",
+  ".svn",
+  "dist",
+  "build",
+  "release",
+  "$RECYCLE.BIN",
+  "System Volume Information",
+  "Windows",
+  "Program Files",
+  "Program Files (x86)",
+  "AppData",
+]);
+const studio3dScanCache = new Map();
+
+function studio3dMime(ext) {
+  switch (ext) {
+    case "glb":
+      return "model/gltf-binary";
+    case "gltf":
+      return "model/gltf+json";
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "bmp":
+      return "image/bmp";
+    case "svg":
+      return "image/svg+xml";
+    case "hdr":
+      return "image/vnd.radiance";
+    case "exr":
+      return "image/x-exr";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function readGlbJson(target) {
+  const handle = await fs.open(target, "r");
+  try {
+    const head = Buffer.alloc(20);
+    await handle.read(head, 0, 20, 0);
+    if (head.toString("utf8", 0, 4) !== "glTF") return null;
+    const jsonLength = head.readUInt32LE(12);
+    if (!jsonLength || jsonLength > 32 * 1024 * 1024) return null;
+    const chunk = Buffer.alloc(jsonLength);
+    await handle.read(chunk, 0, jsonLength, 20);
+    return JSON.parse(chunk.toString("utf8").replace(/\u0000+$/g, ""));
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+async function inspectStudio3dModel(target, ext, bytes) {
+  const rig = { rigged: false, bones: 0, clips: 0, morphs: 0, meshes: 0 };
+  try {
+    if (ext === "glb" || ext === "gltf") {
+      const json = ext === "glb" ? await readGlbJson(target) : JSON.parse((await fs.readFile(target, "utf8")).slice(0, 32 * 1024 * 1024));
+      if (!json) return rig;
+      rig.meshes = Array.isArray(json.meshes) ? json.meshes.length : 0;
+      rig.clips = Array.isArray(json.animations) ? json.animations.length : 0;
+      const skins = Array.isArray(json.skins) ? json.skins : [];
+      rig.bones = skins.reduce((sum, skin) => sum + (Array.isArray(skin.joints) ? skin.joints.length : 0), 0);
+      rig.morphs = (Array.isArray(json.meshes) ? json.meshes : []).reduce(
+        (sum, mesh) =>
+          sum +
+          (Array.isArray(mesh.primitives) ? mesh.primitives.reduce((s, p) => s + (p.targets ? Object.keys(p.targets).length : 0), 0) : 0),
+        0,
+      );
+      rig.rigged = rig.bones > 0;
+      return rig;
+    }
+    if (ext === "fbx") {
+      const size = Math.min(bytes, 6 * 1024 * 1024);
+      const head = Buffer.alloc(size);
+      const handle = await fs.open(target, "r");
+      try {
+        await handle.read(head, 0, size, 0);
+      } finally {
+        await handle.close().catch(() => {});
+      }
+      const raw = head.toString("latin1");
+      const count = (re) => (raw.match(re) || []).length;
+      rig.bones = count(/Deformer:\s*\d+,\s*"Cluster"/g) || count(/LimbNode/g);
+      rig.clips = count(/AnimationStack:/g);
+      rig.morphs = count(/BlendShapeChannel:/g);
+      rig.meshes = count(/Geometry:/g);
+      rig.rigged = rig.bones > 0 || /Deformer:/.test(raw);
+      return rig;
+    }
+  } catch {
+    /* A broken header should not hide the file from the library. */
+  }
+  return rig;
+}
+
+async function scanStudio3dFolder(folder, force = false) {
+  const root = folder ? path.resolve(folder) : "";
+  if (!root) {
+    return { folder: "", scannedAt: new Date().toISOString(), models: [], textures: [], animations: [], errors: [] };
+  }
+  const cached = studio3dScanCache.get(root);
+  if (!force && cached && Date.now() - cached.at < 15000) return cached.index;
+
+  const models = [];
+  const textures = [];
+  const animations = [];
+  const errors = [];
+  let visited = 0;
+
+  const walk = async (dir, rel, depth) => {
+    if (depth > 10 || visited > 5000) return;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      errors.push(path.join(rel || ".", "") + ": " + error.message);
+      return;
+    }
+    for (const entry of entries) {
+      if (visited > 5000) break;
+      if (entry.name.startsWith(".") || STUDIO3D_SKIP.has(entry.name)) continue;
+      const absolute = path.join(dir, entry.name);
+      const relative = rel ? rel + "/" + entry.name : entry.name;
+      if (entry.isDirectory()) {
+        await walk(absolute, relative, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      visited += 1;
+      const ext = path.extname(entry.name).slice(1).toLowerCase();
+      const stat = await fs.stat(absolute).catch(() => null);
+      if (!stat) continue;
+      const base = {
+        name: entry.name,
+        path: absolute.replace(/\\/g, "/"),
+        relative,
+        ext,
+        bytes: stat.size,
+        modified: stat.mtime.toISOString(),
+      };
+      if (STUDIO3D_MODEL_EXTS.has(ext)) {
+        const rig = await inspectStudio3dModel(absolute, ext, stat.size);
+        models.push({ ...base, kind: "model", rig });
+        if (rig.clips > 0 && STUDIO3D_ANIMATION_EXTS.has(ext)) {
+          animations.push({ ...base, kind: "animation", rig });
+        }
+        continue;
+      }
+      if (STUDIO3D_TEXTURE_EXTS.has(ext)) {
+        textures.push({ ...base, kind: "texture" });
+        continue;
+      }
+      if (ext === "anim" || ext === "bvh") {
+        animations.push({ ...base, kind: "animation" });
+      }
+    }
+  };
+
+  await walk(root, "", 0);
+  const byName = (a, b) => a.relative.localeCompare(b.relative, undefined, { numeric: true });
+  models.sort(byName);
+  textures.sort(byName);
+  animations.sort(byName);
+  const index = { folder: root.replace(/\\/g, "/"), scannedAt: new Date().toISOString(), models, textures, animations, errors: errors.slice(0, 12) };
+  studio3dScanCache.set(root, { at: Date.now(), index });
+  return index;
+}
+
+app.get("/api/studio3d/library", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const requested = typeof req.query.dir === "string" && req.query.dir ? path.resolve(req.query.dir) : "";
+    const folder = requested || settings.studio3d?.folder || "";
+    const index = await scanStudio3dFolder(folder, Boolean(requested));
+    res.json(index);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.put("/api/studio3d/library", async (req, res) => {
+  try {
+    const folder = String(req.body?.folder || "").trim();
+    if (!folder) return res.status(400).json({ error: "Choose a folder first." });
+    const absolute = path.resolve(folder);
+    const stat = await fs.stat(absolute).catch(() => null);
+    if (!stat || !stat.isDirectory()) return res.status(400).json({ error: "That folder does not exist." });
+    await saveSettings({ studio3d: { folder: absolute } });
+    const index = await scanStudio3dFolder(absolute, true);
+    log("info", "studio3d", "library folder set", { folder: absolute, models: index.models.length });
+    res.json(index);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/studio3d/file", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const root = settings.studio3d?.folder ? path.resolve(settings.studio3d.folder) : "";
+    const raw = String(req.query.path || "");
+    if (!raw) return res.status(400).json({ error: "path is required" });
+    const target = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(root || ".", raw);
+    if (!root || !isInside(root, target)) return res.status(403).json({ error: "That file is outside the 3D library folder." });
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat || !stat.isFile()) return res.status(404).json({ error: "File not found" });
+    res.setHeader("Content-Type", studio3dMime(path.extname(target).slice(1).toLowerCase()));
+    res.setHeader("Cache-Control", "no-cache");
+    res.sendFile(target);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/bridge/library", async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const folder = settings.studio3d?.folder || "";
+    const index = await scanStudio3dFolder(folder);
+    const kind = String(req.query.kind || "").toLowerCase();
+    const query = String(req.query.query || "").toLowerCase().trim();
+    const limit = Math.max(1, Math.min(120, Number(req.query.limit) || 60));
+    const pool = [
+      ...(kind === "textures" ? [] : index.models),
+      ...(kind === "animations" ? index.animations : kind === "textures" ? [] : kind === "models" ? [] : index.textures),
+    ];
+    const filtered = (query ? pool.filter((asset) => asset.relative.toLowerCase().includes(query) || asset.name.toLowerCase().includes(query)) : pool).slice(0, limit);
+    res.json({
+      ok: true,
+      folder: index.folder,
+      scannedAt: index.scannedAt,
+      counts: { models: index.models.length, textures: index.textures.length, animations: index.animations.length },
+      assets: filtered,
+    });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+/*
+ * Library note for assistants: the 3D applet never copies assets into a
+ * project. It registers one user-chosen folder and serves files read-only.
+ * Coding and Unity assistants can copy a library asset into their workspace
+ * on request, which keeps the source file untouched.
+ */
+
+/* ------------------------------------------------------------------ */
 /* MCP bridge                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -7690,6 +8802,13 @@ app.post("/api/bridge/tool", async (req, res) => {
 });
 
 app.get("/api/bridge/ping", (req, res) => res.json({ ok: true, clients: [...clients.entries()].map(([k, v]) => [k, v.size]) }));
+
+app.get("/api/bridge/scenes", (req, res) => {
+  const scenes = [...clients.entries()]
+    .filter(([, set]) => [...set].some((client) => client.readyState === 1))
+    .map(([projectId, set]) => ({ projectId, clients: set.size }));
+  res.json({ ok: true, scenes });
+});
 
 /* ------------------------------------------------------------------ */
 /* WebSocket                                                           */
